@@ -130,10 +130,20 @@ async function loadPlayers() {
 const SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv', 'v']);
 
 function normName(s) {
-  return String(s || '').toLowerCase()
+  const toks = String(s || '').toLowerCase()
     .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9 ]+/g, ' ')
-    .split(/\s+/).filter(t => t && !SUFFIXES.has(t)).join(' ');
+    .split(/\s+/).filter(t => t && !SUFFIXES.has(t));
+  // collapse runs of single letters so "A.J." == "AJ" ("a j brown" -> "aj brown")
+  const merged = [];
+  for (let i = 0; i < toks.length; i++) {
+    if (toks[i].length === 1) {
+      let j = i, run = '';
+      while (j < toks.length && toks[j].length === 1) { run += toks[j]; j++; }
+      merged.push(run); i = j - 1;
+    } else merged.push(toks[i]);
+  }
+  return merged.join(' ');
 }
 
 function normPos(s) {
@@ -412,6 +422,7 @@ function computeBoard() {
     if (exp.slot !== p.draft_slot) slotMismatch++;
   }
   if (slotMismatch) anomalies.push(`${slotMismatch} pick(s) landed on unexpected slots — snake math may be off (3rd-round reversal? manual reorder?). Trust the picks feed, double-check "picks until you".`);
+  if (meta.type === 'auction') anomalies.push('This is an AUCTION draft — this tool only supports snake/linear order math. Pick predictions will be wrong.');
 
   const pickCount = picks.length;
   const currentPickNo = pickCount + 1;
@@ -461,7 +472,8 @@ function computeBoard() {
   const available = ST.rankings.filter(r =>
     !(r.player_id && pickedIds.has(r.player_id)) &&
     !(!r.player_id && pickedIds.has('csvrow:' + r.rank)) &&
-    !(r.player_id && manual[r.player_id])
+    !(r.player_id && manual[r.player_id]) &&
+    !manual['csvrow:' + r.rank]                      // manual X on an unresolved CSV row
   );
 
   // --- rosters + needs per slot
@@ -471,16 +483,19 @@ function computeBoard() {
   for (let sl = 1; sl <= teams; sl++) rosterBySlot[sl] = { players: [], counts: {} };
   for (const p of pickInfo) {
     const r = rosterBySlot[p.slot]; if (!r) continue;
-    r.players.push({ name: p.name, pos: p.pos, round: p.round });
+    r.players.push({ name: p.name, pos: p.pos, team: p.team, round: p.round });
     r.counts[p.pos] = (r.counts[p.pos] || 0) + 1;
   }
   const needsBySlot = {};
   for (let sl = 1; sl <= teams; sl++) needsBySlot[sl] = rosterNeeds(rosterBySlot[sl].counts, slots, currentRound, rounds);
 
-  // --- teams picking between now and my next pick, with predicted targets
+  // --- teams picking between now and my next pick, with predicted targets.
+  // When I'm ON the clock, the question becomes "will X survive to my FOLLOWING
+  // pick if I pass now" — so the horizon is myPickNos[1], not the current pick.
   const intervening = [];
-  if (myNextPickNo !== null) {
-    for (let n = currentPickNo + (onClock ? 1 : 0); n < myNextPickNo; n++) {
+  const survivalHorizon = onClock ? (myPickNos[1] || null) : myNextPickNo;
+  if (survivalHorizon !== null) {
+    for (let n = currentPickNo + (onClock ? 1 : 0); n < survivalHorizon; n++) {
       const t = pickToSlot(n, meta);
       const needs = needsBySlot[t.slot];
       const top = Object.entries(needs.weights).sort((a, b) => b[1] - a[1]).filter(([, v]) => v > 0.12).slice(0, 3);
@@ -549,13 +564,23 @@ function computeBoard() {
 
   const unresolvedCsv = ST.rankings.filter(r => !r.player_id && !r._linkedPick).length;
 
+  // Is the currently displayed recommendation's player already gone?
+  let adviceRecTaken = false;
+  const rec = ST.adv.latest && ST.adv.latest.parsed && ST.adv.latest.parsed.pick;
+  if (rec && rec.name) {
+    const rn = normName(rec.name);
+    const stillHere = available.some(r => normName(r.name) === rn);
+    adviceRecTaken = !stillHere;
+  }
+
   ST.board = {
     status, teams, rounds, totalPicks, pickCount, currentPickNo,
     currentRound, phase, onClockSlot: cur ? cur.slot : null,
     mySlot, myNextPickNo, myPickNos, picksUntilMine, onClock,
-    anomalies, unmatchedPicks, unresolvedCsv,
+    anomalies, unmatchedPicks, unresolvedCsv, adviceRecTaken,
     picks: pickInfo, availableCount: available.length,
-    available: available.slice(0, 200),
+    available,                                  // full list; a rankings CSV is a few hundred rows
+
     rosterBySlot, myNeeds, intervening, candidates, fallback,
     scoring: meta.metadata ? meta.metadata.scoring_type : null,
     degraded: ST.poll.degraded, lastSyncAt: ST.poll.lastOkAt,
@@ -587,6 +612,7 @@ async function pollOnce() {
     const needMeta = !ST.draft.meta || pollTick % 8 === 1 || ST.draft.status !== 'drafting';
     if (needMeta) {
       const meta = await fetchJson(`${SLEEPER_BASE}/draft/${id}`, {}, 10000);
+      if (ST.session.draft_id !== id) return scheduleNextPoll(POLL_MS);  // draft switched mid-fetch
       const prevStatus = ST.draft.status;
       ST.draft.meta = meta; ST.draft.status = meta.status;
       if (prevStatus && prevStatus !== meta.status) {
@@ -598,6 +624,7 @@ async function pollOnce() {
     }
     if (ST.draft.status !== 'pre_draft') {
       const picks = await fetchJson(`${SLEEPER_BASE}/draft/${id}/picks`, {}, 10000);
+      if (ST.session.draft_id !== id) return scheduleNextPoll(POLL_MS);  // draft switched mid-fetch
       const changed = picks.length !== ST.draft.picks.length;
       ST.draft.picks = picks;
       if (changed || needMeta) {
@@ -631,8 +658,15 @@ function pollStatus() {
 
 function advisorOnBoardChange() {
   const b = ST.board;
+  const turnStarted = b && b.onClock && !ST.adv.prevOnClock;
+  if (b) ST.adv.prevOnClock = b.onClock;
   if (!b || b.status !== 'drafting' || !b.mySlot || !ST.rankings.length) return;
   if (b.picksUntilMine === null) return;
+  if (turnStarted) {
+    ST.adv.turn = { pickNo: b.currentPickNo, startedAt: Date.now(), visibleAt: null, how: null };
+    ST.adv.turns = ST.adv.turns || [];
+    ST.adv.turns.push(ST.adv.turn);
+  } else if (!b.onClock) ST.adv.turn = null;
   const withinWindow = b.picksUntilMine <= SPECULATE_WITHIN;   // 0 = on the clock
   if (!withinWindow) {
     // outside window: cancel any in-flight speculation, keep last completed
@@ -640,13 +674,33 @@ function advisorOnBoardChange() {
     return;
   }
   const inf = ST.adv.inflight;
-  if (inf && inf.basedOn === b.pickCount) return;              // already current
-  if (ST.adv.latest && ST.adv.latest.basedOn === b.pickCount) {
-    if (b.onClock) broadcast('advice', adviceEvent(ST.adv.latest));  // instant re-render
+  const latest = ST.adv.latest;
+  if (latest && latest.basedOn === b.pickCount) {
+    // fully current recommendation already exists
+    if (inf && inf.basedOn !== b.pickCount) abortInflight('superseded-by-latest');
+    if (b.onClock) { broadcast('advice', adviceEvent(latest)); markVisible('precomputed'); }
     return;
   }
-  if (inf) abortInflight('superseded');
+  if (inf) {
+    if (inf.basedOn === b.pickCount) return;                   // current request already running
+    if (b.onClock && inf.buffer) {
+      // My turn started while a speculative request is mid-stream: KEEP it
+      // (tagged "as of pick N"), refresh on the current board once it lands.
+      inf.refreshAfter = true;
+      if (latest) { broadcast('advice', adviceEvent(latest)); markVisible('stale-precomputed'); }
+      else if (inf.pickLine) markVisible('stale-streaming');
+      return;
+    }
+    abortInflight('superseded');
+  }
+  // instant visibility with the last completed rec (tagged stale) while fresh one runs
+  if (b.onClock && latest) { broadcast('advice', adviceEvent(latest)); markVisible('stale-precomputed'); }
   startAdvice(b);
+}
+
+function markVisible(how) {
+  const t = ST.adv.turn;
+  if (t && t.visibleAt == null) { t.visibleAt = Date.now(); t.how = how; t.visibleMs = t.visibleAt - t.startedAt; }
 }
 
 function abortInflight(reason) {
@@ -670,6 +724,7 @@ function adviceEvent(rec) {
 function startAdvice(board) {
   if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) {
     broadcast('advice', { phase: 'error', basedOn: board.pickCount, error: 'ANTHROPIC_API_KEY not set — using fallback board', seq: ++ST.adv.seq });
+    if (board.onClock) markVisible('fallback-no-key');
     return;
   }
   const seq = ++ST.adv.seq;
@@ -692,7 +747,11 @@ function startAdvice(board) {
       inf.buffer += delta;
       if (!inf.pickLine) {
         const m = inf.buffer.match(/PICK:\s*([^\n]+)\n/);
-        if (m) { inf.pickLine = m[1].trim(); broadcast('advice', { phase: 'streaming', seq, basedOn: inf.basedOn, pickLine: inf.pickLine }); }
+        if (m) {
+          inf.pickLine = m[1].trim();
+          broadcast('advice', { phase: 'streaming', seq, basedOn: inf.basedOn, pickLine: inf.pickLine });
+          if (ST.board && ST.board.onClock) markVisible('streaming');
+        }
       }
       broadcast('advice_delta', { seq, basedOn: inf.basedOn, delta });
     },
@@ -705,8 +764,20 @@ function startAdvice(board) {
     },
   };
 
+  // Watchdogs: a hung connection must never leave the UI stuck on "reasoning".
+  // No first event within 30s, or no completion within ADVICE_TIMEOUT_MS,
+  // aborts through the ERROR path (fallback + on-clock retry), not silently.
+  const firstEventTimer = setTimeout(() => {
+    if (!inf.aborted && lat.ttfe === null) { inf.timedOut = 'no-first-event'; controller.abort(); }
+  }, 30000);
+  const totalTimer = setTimeout(() => {
+    if (!inf.aborted) { inf.timedOut = 'total-timeout'; controller.abort(); }
+  }, Number(process.env.ADVICE_TIMEOUT_MS || 150000));
+  const clearTimers = () => { clearTimeout(firstEventTimer); clearTimeout(totalTimer); };
+
   const run = MOCK_LLM ? mockAdvise(board, controller.signal, handlers) : callAnthropic(board, controller.signal, handlers);
   run.then((result) => {
+    clearTimers();
     if (inf.aborted) return;
     ST.adv.inflight = null;
     lat.total = Date.now() - inf.startedAt;
@@ -723,14 +794,23 @@ function startAdvice(board) {
     }
     ST.adv.latest = rec;
     broadcast('advice', adviceEvent(rec));
+    if (ST.board && ST.board.onClock) markVisible('completed');
     log(`advice #${seq} done (basedOn=${rec.basedOn}, ttft=${lat.ttft}ms, total=${lat.total}ms, cacheRead=${lat.cacheRead})`);
+    // a kept-stale stream finished while on the clock: refresh on the current board
+    const b = ST.board;
+    if (inf.refreshAfter && b && b.onClock && b.status === 'drafting' && b.pickCount !== inf.basedOn && !ST.adv.inflight) {
+      startAdvice(b);
+    }
   }).catch((e) => {
-    if (inf.aborted) return;               // aborts are expected, not errors
+    clearTimers();
+    if (inf.aborted) return;               // deliberate aborts are expected, not errors
     ST.adv.inflight = null;
     lat.total = Date.now() - inf.startedAt;
-    lat.error = e.message;
+    lat.error = inf.timedOut ? `timeout (${inf.timedOut})` : e.message;
+    if (inf.timedOut) e = new Error(lat.error);
     warn(`advice #${seq} failed: ${e.message}`);
     broadcast('advice', { phase: 'error', seq, basedOn: inf.basedOn, error: `advisor error (${e.message}) — fallback board is live` });
+    if (ST.board && ST.board.onClock) markVisible('fallback-after-error');
     // one automatic retry if we're actually on the clock and this wasn't a kill-switch test
     const b = ST.board;
     if (b && b.onClock && b.pickCount === inf.basedOn && !ST.adv.retryPending) {
@@ -759,25 +839,32 @@ function rebuildStaticPrefix() {
     return f.join('|');
   });
   ST.staticPrefix = [
-    'You are an elite fantasy football draft analyst embedded in a live draft tool. You will be called dozens of times during one draft; every call gives you the precomputed board state and asks for ONE pick recommendation.',
+    'You are the draft-room analyst inside a live fantasy football draft tool. You are called once per recommendation, dozens of times across the draft, always with the same structure: this static briefing, then a user message with the precomputed board state. Recommend exactly ONE pick.',
     '',
     '## League',
     `Teams: ${s.teams || '?'} · Rounds: ${s.rounds || '?'} · Scoring: ${scoring}`,
     `Starting slots: QB ${slots.QB}, RB ${slots.RB}, WR ${slots.WR}, TE ${slots.TE}, FLEX ${slots.FLEX}${slots.SFLEX ? `, SUPERFLEX ${slots.SFLEX}` : ''}, K ${slots.K}, DEF ${slots.DEF}, Bench ${slots.BN}`,
     '',
-    '## How to decide',
-    '- EARLY rounds (1-3): take the best value; weigh roster composition lightly. Do not reach more than a few spots past rank. Elite RB/WR anchor tiers matter most.',
-    '- MIDDLE rounds: tier cliffs and positional runs dominate. If a candidate is the LAST of a tier and unlikely to survive, that beats marginal rank value. Watch the listed run risks.',
-    '- LATE rounds: upside over floor — target high-ceiling bench stacks, handcuffs to your own RBs, QB/WR stacks, and take K and DEF only in the final 2 rounds unless the board says otherwise.',
-    '- The survival percentages are computed for you (base = rank pressure; adjusted = rank pressure + roster needs of the specific teams picking before your next turn). A high-value player with high adjusted survival can be deferred; a tier-closer with low survival cannot.',
-    '- VORP (if present) is points over the replacement-level starter at that position for this league size — use it to compare across positions.',
-    '- Recommend ONLY players from the CANDIDATES list in the user message. Never invent players or stats.',
+    '## Decision framework by phase (the user message states the current phase)',
+    '- EARLY (rounds 1-3): best value wins; roster composition is a light tiebreak. Reaching more than ~5 spots past rank needs a strong reason. Anchor RB/WR tiers matter most; in PPR lean receptions.',
+    '- MIDDLE: tier cliffs and positional runs dominate. The LAST player of a tier with low adjusted survival beats a marginally higher-ranked player from a deep tier. React to runs one pick early, not one late.',
+    '- LATE (final 4 rounds): ceiling over floor. Prioritize: handcuffs to YOUR OWN early RBs, cheap QB/pass-catcher stacks with players already on your roster, league-winner upside bench picks. Take K and DEF in the last 2 rounds only, one each, prioritizing good week-1 matchups.',
     '',
-    '## Output format (STRICT — the UI parses this)',
-    'First line, immediately, before anything else: `PICK: <Player Name> (<POS>, <TEAM>)`',
+    '## How to read the numbers (all precomputed — trust them, do not recalculate)',
+    '- survival base% = chance the player survives to your next pick from rank pressure alone; adj% additionally accounts for the actual roster needs of the specific teams picking before you; [n] = how many of those teams are hungry for that position. Low adj% on a player you want means take him NOW; high adj% means you can defer and gain a pick.',
+    '- VORP = projected points above the replacement-level starter at that position for this league. Use it to compare value ACROSS positions; rank compares within the consensus.',
+    '- Roster-gap listings for other teams tell you where runs will come from.',
+    '',
+    '## Hard rules',
+    '- Recommend ONLY players from the CANDIDATES list. Never invent players, stats, or news.',
+    '- Bye weeks are a minor tiebreak, never a primary reason before the late rounds.',
+    '- Do not restate this briefing or the board; output only the format below.',
+    '',
+    '## Output format (STRICT — parsed by machine)',
+    'First line, immediately: `PICK: <Player Name> (<POS>, <TEAM>)`',
     'Then a fenced ```json block exactly matching:',
     '{"pick":{"name":"","position":"","team":"","why":"<=30 words"},"alternatives":[{"name":"","position":"","why":"<=15 words"},{"name":"","position":"","why":"<=15 words"}],"tier_alert":<string or null>,"run_risk":<string or null>,"board_read":"<=40 words"}',
-    'No text after the JSON block.',
+    'Use the exact player names as they appear in CANDIDATES. alternatives = the best two different-strategy fallbacks if your pick is sniped. tier_alert = a tier about to close that affects THIS pick, else null. run_risk = a run likely before your next turn, else null. No text after the JSON block.',
     '',
     '## Your full rankings (rank|tier|name|pos|team|bye|proj|vorp|notes)',
     ...lines,
@@ -792,7 +879,7 @@ function buildDynamicMessage(board) {
   lines.push('');
   const my = b.rosterBySlot[b.mySlot];
   lines.push(`## Your roster (${my.players.length} picks)`);
-  lines.push(my.players.length ? my.players.map(p => `R${p.round} ${p.name} (${p.pos})`).join('; ') : '(empty)');
+  lines.push(my.players.length ? my.players.map(p => `R${p.round} ${p.name} (${p.pos} ${p.team || ''})`).join('; ') : '(empty)');
   const d = b.myNeeds.dedicated;
   lines.push(`Open starters: ${Object.entries(d).filter(([, v]) => v > 0).map(([k, v]) => `${k}x${v}`).join(', ') || 'none'}${b.myNeeds.flexOpen ? `, FLEXx${b.myNeeds.flexOpen}` : ''}${b.myNeeds.sflexOpen ? `, SFLEXx${b.myNeeds.sflexOpen}` : ''}`);
   lines.push('');
@@ -819,6 +906,35 @@ function buildDynamicMessage(board) {
   lines.push('');
   lines.push('Give your recommendation now in the strict output format.');
   return lines.join('\n');
+}
+
+// Write the prompt-cache entry before the draft heats up so the first real
+// advice call reads the cache instead of writing it. max_tokens: 0 is the
+// documented pre-warm shape (no output billed). Failures are non-fatal.
+let prewarmedPrefix = null;
+async function prewarmCache() {
+  if (MOCK_LLM || !process.env.ANTHROPIC_API_KEY) return;
+  if (!ST.staticPrefix || ST.staticPrefix === prewarmedPrefix) return;
+  prewarmedPrefix = ST.staticPrefix;
+  try {
+    const r = await fetch(ANTHROPIC_URL, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: MODEL, max_tokens: 0,
+        system: [{ type: 'text', text: ST.staticPrefix, cache_control: { type: 'ephemeral', ttl: '1h' } }],
+        messages: [{ role: 'user', content: 'warmup' }],
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const j = await r.json().catch(() => null);
+    if (r.ok && j && j.usage) log(`prompt cache prewarmed: wrote ${j.usage.cache_creation_input_tokens || 0}, read ${j.usage.cache_read_input_tokens || 0} tokens`);
+    else warn(`cache prewarm skipped (HTTP ${r.status}${j && j.error ? ': ' + j.error.message : ''})`);
+  } catch (e) { warn('cache prewarm failed (non-fatal):', e.message); }
 }
 
 async function callAnthropic(board, signal, h) {
@@ -954,6 +1070,7 @@ function latencySummary() {
     ttft_p50: pct(ttfts, 0.5), ttft_p95: pct(ttfts, 0.95),
     total_p50: pct(totals, 0.5), total_p95: pct(totals, 0.95),
     cacheReads: done.filter(l => l.cacheRead > 0).length,
+    turns: (ST.adv.turns || []).map(t => ({ pickNo: t.pickNo, visibleMs: t.visibleMs != null ? t.visibleMs : null, how: t.how })),
     log: ST.adv.latency.slice(-100),
   };
 }
@@ -991,6 +1108,8 @@ const server = http.createServer(async (req, res) => {
       ST.sse.add(res);
       sseWrite(res, 'snapshot', snapshot());
       req.on('close', () => ST.sse.delete(res));
+      req.on('error', () => ST.sse.delete(res));
+      res.on('error', () => ST.sse.delete(res));
       return;
     }
 
@@ -1010,6 +1129,7 @@ const server = http.createServer(async (req, res) => {
       computeBoard();
       broadcast('rankings', { meta, rankings: ST.rankings });
       broadcast('board', ST.board);
+      prewarmCache();                       // fire-and-forget
       return json(res, 200, meta);
     }
 
@@ -1017,16 +1137,18 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse(await readBody(req));
       const draftId = String(body.draft_id || '').trim();
       if (!/^\d{5,25}$/.test(draftId)) return json(res, 400, { error: 'draft_id must be the numeric Sleeper draft id' });
+      let meta;
+      try {
+        meta = await fetchJson(`${SLEEPER_BASE}/draft/${draftId}`, {}, 10000);
+      } catch (e) { return json(res, 502, { error: `could not fetch draft: ${e.message}` }); }
+      // validated: now commit the session change
       ST.session.draft_id = draftId;
       ST.session.my_slot = Number(body.my_slot) || null;
       saveJson('session.json', ST.session);
-      ST.draft = { meta: null, picks: [], anomalies: [], status: null };
-      ST.adv.latest = null; if (ST.adv.inflight) abortInflight('draft-changed');
-      try {
-        const meta = await fetchJson(`${SLEEPER_BASE}/draft/${draftId}`, {}, 10000);
-        ST.draft.meta = meta; ST.draft.status = meta.status;
-      } catch (e) { return json(res, 502, { error: `could not fetch draft: ${e.message}` }); }
+      ST.draft = { meta, picks: [], anomalies: [], status: meta.status };
+      ST.adv.latest = null; ST.adv.prevOnClock = false; if (ST.adv.inflight) abortInflight('draft-changed');
       computeVorp(); rebuildStaticPrefix(); computeBoard();
+      prewarmCache();                       // fire-and-forget
       startPolling();
       broadcast('board', ST.board);
       broadcast('status', pollStatus());
@@ -1049,6 +1171,7 @@ const server = http.createServer(async (req, res) => {
       else delete ST.session.manual[body.player_id];
       saveJson('session.json', ST.session);
       computeBoard(); broadcast('board', ST.board);
+      broadcast('session', { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes });
       return json(res, 200, { ok: true });
     }
 
@@ -1058,6 +1181,7 @@ const server = http.createServer(async (req, res) => {
       if (body.note) ST.session.notes[body.player_id] = String(body.note).slice(0, 300);
       else delete ST.session.notes[body.player_id];
       saveJson('session.json', ST.session);
+      broadcast('session', { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes });
       return json(res, 200, { ok: true });
     }
 
@@ -1072,7 +1196,7 @@ const server = http.createServer(async (req, res) => {
       ST.session = { draft_id: null, my_slot: null, manual: {}, notes: {} };
       saveJson('session.json', ST.session);
       ST.draft = { meta: null, picks: [], anomalies: [], status: null };
-      ST.board = null; ST.adv.latest = null;
+      ST.board = null; ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.turn = null;
       if (ST.adv.inflight) abortInflight('reset');
       clearTimeout(ST.poll.timer); ST.poll.running = false; ST.poll.failures = 0; ST.poll.degraded = false;
       broadcast('board', null); broadcast('status', pollStatus());
@@ -1090,6 +1214,9 @@ const server = http.createServer(async (req, res) => {
       }
       if (p === '/api/debug/stats') {
         return json(res, 200, { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed, sseClients: ST.sse.size, uptime: process.uptime() });
+      }
+      if (p === '/api/debug/prompt') {
+        return json(res, 200, { staticPrefix: ST.staticPrefix, dynamic: ST.board ? buildDynamicMessage(ST.board) : null });
       }
     }
 

@@ -50,11 +50,12 @@ function onBoard(b) {
     curTurn = { pickNo: b.currentPickNo, onClockAt: now(), visibleAt: null, how: null, priorReady: false };
     turns.push(curTurn);
     console.log(`ON THE CLOCK: pick #${b.currentPickNo} (round ${b.currentRound}) picks made=${b.pickCount}`);
-    // advice already completed for this exact board? that's the speculative win
-    if (advice && advice.phase === 'done' && advice.basedOn === b.pickCount) {
+    // A completed rec (even one tagged "as of pick N-1") renders instantly —
+    // that is exactly what the UI shows, so it counts as visible.
+    if (advice && advice.phase === 'done') {
       curTurn.priorReady = true;
-      markVisible('speculative-precomputed');
-    } else if (advice && advice.phase === 'streaming' && advice.basedOn === b.pickCount && advice.pickLine) {
+      markVisible(advice.basedOn === b.pickCount ? 'speculative-precomputed' : 'stale-precomputed');
+    } else if (advice && advice.phase === 'streaming' && advice.pickLine) {
       markVisible('speculative-streaming');
     }
     // fallback board always counts as *something* visible but we track it separately
@@ -83,8 +84,8 @@ function onAdvice(d) {
     else problems.push(`unexpected advisor error: ${d.error}`);
     if (curTurn) markVisible('fallback-after-error');
   }
-  if (d.phase === 'streaming' && d.pickLine && curTurn && d.basedOn === board.pickCount) markVisible('streaming-pickline');
-  if (d.phase === 'done' && curTurn && d.basedOn === board.pickCount) {
+  if (d.phase === 'streaming' && d.pickLine && curTurn) markVisible('streaming-pickline');
+  if (d.phase === 'done' && curTurn) {
     if (killFired && killObservedError) killRecovered = true;
     markVisible('completed');
   }

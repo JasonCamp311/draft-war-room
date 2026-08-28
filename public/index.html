@@ -153,8 +153,9 @@
 const $ = (id) => document.getElementById(id);
 const S = {
   board: null, rankings: [], rankingsMeta: null, session: null, status: null,
-  advice: null,           // last rendered advice event
-  adviceSeq: -1,          // stale guard: never render a lower seq
+  lastDone: null,         // latest completed recommendation (may be stale vs board)
+  live: null,             // current in-progress advice event (reasoning/streaming/error)
+  streamSeq: -1,          // stale guard for the live stream
   streamBuf: '',
   es: null, esOpen: false,
 };
@@ -174,28 +175,36 @@ function connectSSE() {
       if (d.session.draft_id) $('draftId').value = d.session.draft_id;
       populateSlots(S.board ? S.board.teams : 14, d.session.my_slot);
     }
-    if (d.advice) { S.adviceSeq = d.advice.seq; S.advice = d.advice; }
-    if (d.adviceInflight && d.adviceInflight.seq > S.adviceSeq) {
-      S.adviceSeq = d.adviceInflight.seq;
-      S.advice = { phase: d.adviceInflight.buffer ? 'streaming' : 'reasoning', ...d.adviceInflight };
+    S.lastDone = d.advice || null;
+    if (d.adviceInflight) {
+      S.streamSeq = d.adviceInflight.seq;
+      S.live = { phase: d.adviceInflight.buffer ? 'streaming' : 'reasoning', ...d.adviceInflight };
       S.streamBuf = d.adviceInflight.buffer || '';
-    }
+    } else { S.live = null; S.streamBuf = ''; }
     renderAll();
   });
   es.addEventListener('board', (e) => { S.board = JSON.parse(e.data); renderAll(); });
   es.addEventListener('rankings', (e) => { const d = JSON.parse(e.data); S.rankings = d.rankings; S.rankingsMeta = d.meta; renderRankings(); });
   es.addEventListener('status', (e) => { S.status = JSON.parse(e.data); renderStatus(); renderBanners(); });
+  es.addEventListener('session', (e) => { S.session = JSON.parse(e.data); renderBanners(); renderRankings(); });
   es.addEventListener('advice', (e) => {
     const d = JSON.parse(e.data);
-    if (d.seq !== undefined && d.seq < S.adviceSeq) return;      // stale
-    S.adviceSeq = d.seq !== undefined ? d.seq : S.adviceSeq;
-    if (d.phase === 'reasoning') S.streamBuf = '';
-    S.advice = d;
+    if (d.phase === 'done') {
+      // accept any done that is same-or-newer than the one we show
+      if (S.lastDone && d.seq < S.lastDone.seq) return;
+      S.lastDone = d;
+      if (S.live && S.live.seq <= d.seq) S.live = null;         // its stream finished
+    } else {
+      if (d.seq < S.streamSeq) return;                          // stale stream event
+      S.streamSeq = d.seq;
+      if (d.phase === 'reasoning') S.streamBuf = '';
+      S.live = d;
+    }
     renderAdvice();
   });
   es.addEventListener('advice_delta', (e) => {
     const d = JSON.parse(e.data);
-    if (d.seq < S.adviceSeq) return;
+    if (d.seq !== S.streamSeq) return;
     S.streamBuf += d.delta;
     renderStreamDelta();
   });
@@ -251,14 +260,14 @@ function editNote(pid, name) {
 }
 
 // ---------- rendering ----------
-function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
 function renderAll() { renderStatus(); renderBanners(); renderClock(); renderRankings(); renderRoster(); renderPicks(); renderUpcoming(); renderAdvice(); }
 
 function renderStatus() {
   const dot = $('connDot'); const txt = $('statusText');
   const st = S.status || {};
-  const degraded = S.board && S.board.degraded;
+  const degraded = st.degraded || (S.board && S.board.degraded);
   if (!S.esOpen) { dot.className = 'dot bad'; txt.textContent = 'reconnecting to server…'; return; }
   if (degraded) { dot.className = 'dot bad'; txt.textContent = 'Sleeper degraded — retrying (state kept)'; return; }
   dot.className = 'dot ok';
@@ -281,8 +290,22 @@ function renderBanners() {
     if (board.status === 'pre_draft') out.push('<div class="banner info">Draft has not started — waiting for Sleeper.</div>');
     if (board.status === 'complete') out.push('<div class="banner info">Draft complete.</div>');
   }
+  const manual = S.session && S.session.manual ? Object.keys(S.session.manual) : [];
+  if (manual.length) {
+    const items = manual.map((id) => {
+      let name = id;
+      if (id.startsWith('csvrow:')) { const row = S.rankings.find((r) => 'csvrow:' + r.rank === id); name = row ? row.name : id; }
+      else { const row = S.rankings.find((r) => r.player_id === id); name = row ? row.name : id; }
+      return `<button class="xbtn" data-unmark="${esc(id)}" title="undo manual mark">${esc(name)} ↩</button>`;
+    }).join(' ');
+    out.push(`<div class="banner info">Manually marked drafted: ${items}</div>`);
+  }
   b.innerHTML = out.join('');
 }
+$('banners').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-unmark]'); if (!btn) return;
+  mark(btn.dataset.unmark, false);
+});
 
 function renderClock() {
   const el = $('clockInfo'); const b = S.board;
@@ -313,19 +336,29 @@ function renderRankings() {
     const cand = b && b.candidates ? b.candidates.find((c) => c.rank === r.rank) : null;
     const sv = cand ? cand.survival.adj : null;
     const svCls = sv == null ? '' : (sv < 35 ? 'low' : sv < 70 ? 'mid' : '');
+    const markId = r.player_id || ('csvrow:' + r.rank);      // unresolved rows X by pseudo-id
     const note = S.session && S.session.notes && r.player_id && S.session.notes[r.player_id];
-    return `<tr class="${r.player_id ? '' : 'unmatchedRow'}${gone ? ' gone' : ''}">
+    return `<tr data-pid="${esc(r.player_id || '')}" data-mark="${esc(markId)}" data-name="${esc(r.name)}" class="${r.player_id ? '' : 'unmatchedRow'}${gone ? ' gone' : ''}">
       <td>${r.rank}</td><td>${r.tier != null ? r.tier : ''}</td>
-      <td title="${r.player_id ? esc(r.player_id) + (note ? ' — ' + esc(note) : '') : 'NOT matched to a Sleeper player'}"
-          ondblclick="editNote('${esc(r.player_id || '')}','${esc(r.name)}')">${r.player_id ? '' : '⚠ '}${esc(r.name)}${note ? ' 📝' : ''}</td>
+      <td class="nameCell" title="${r.player_id ? esc(r.player_id) + (note ? ' — ' + esc(note) : ' — double-click to add a note') : 'NOT matched to a Sleeper player'}">${r.player_id ? '' : '⚠ '}${esc(r.name)}${note ? ' 📝' : ''}</td>
       <td class="pos-${r.pos}">${r.pos}</td><td>${r.bye != null ? r.bye : ''}</td>
       <td>${r.proj != null ? r.proj : ''}</td><td>${r.vorp != null ? r.vorp : ''}</td>
       <td class="surv ${svCls}">${sv != null ? sv + '%' : ''}</td>
-      <td>${gone ? '' : `<button class="xbtn" title="mark drafted (manual override)" onclick="mark('${esc(r.player_id || '')}',true)">✕</button>`}</td>
+      <td>${gone ? '' : '<button class="xbtn" title="mark drafted (manual override)">✕</button>'}</td>
     </tr>`;
   }).join('');
 }
 $('search').oninput = () => renderRankings();
+$('rankBody').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.xbtn'); if (!btn) return;
+  const tr = btn.closest('tr'); if (!tr) return;
+  mark(tr.dataset.mark, true);
+});
+$('rankBody').addEventListener('dblclick', (ev) => {
+  const cell = ev.target.closest('.nameCell'); if (!cell) return;
+  const tr = cell.closest('tr'); if (!tr || !tr.dataset.pid) return;
+  editNote(tr.dataset.pid, tr.dataset.name);
+});
 
 function renderRoster() {
   const b = S.board;
@@ -367,75 +400,100 @@ function renderFallback() {
     : '<tr><td class="muted">import rankings first</td></tr>';
 }
 
-function renderAdvice() {
-  renderFallback();
-  const a = S.advice; const b = S.board;
-  const tag = $('adviceTag'), nameEl = $('pickName'), why = $('adviceWhy'), alts = $('adviceAlts'), alerts = $('adviceAlerts'), stream = $('adviceStream');
-  if (!a) {
-    nameEl.textContent = b && b.onClock ? 'No recommendation yet — use the fallback board below.' : '—';
-    nameEl.className = b && b.onClock ? 'fallbackTitle' : 'muted';
-    tag.textContent = ''; why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = ''; stream.classList.add('hidden');
-    return;
-  }
-  const staleNote = (b && a.basedOn != null && a.basedOn < b.pickCount)
-    ? ` <span class="stale">· board moved (${b.pickCount - a.basedOn} newer pick${b.pickCount - a.basedOn > 1 ? 's' : ''}${a.phase === 'done' ? ', refreshing' : ''})</span>` : '';
-  if (a.phase === 'reasoning') {
-    tag.innerHTML = `<span class="reasoning">claude-fable-5 reasoning on board as of pick ${a.basedOn}</span>${staleNote}`;
-    nameEl.textContent = a.speculative ? 'Preparing recommendation…' : 'Thinking…';
-    nameEl.className = 'muted';
-    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = '';
-    stream.classList.add('hidden'); stream.textContent = '';
-    return;
-  }
-  if (a.phase === 'error') {
-    tag.innerHTML = `<span style="color:var(--bad)">✕ ${esc(a.error)}</span>`;
-    nameEl.textContent = 'Use the fallback board below';
-    nameEl.className = 'fallbackTitle';
-    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = ''; stream.classList.add('hidden');
-    return;
-  }
-  if (a.phase === 'streaming') {
-    tag.innerHTML = `streaming · based on board as of pick ${a.basedOn}${staleNote}`;
-    if (a.pickLine) { nameEl.textContent = a.pickLine; nameEl.className = ''; }
-    stream.classList.remove('hidden');
-    renderStreamDelta();
-    return;
-  }
-  // done
-  tag.innerHTML = `based on board as of pick ${a.basedOn}${a.mock ? ' · <b>MOCK</b>' : ''}${staleNote}` +
-    (a.timings && a.timings.total ? ` <span class="muted">· ${(a.timings.total / 1000).toFixed(1)}s${a.timings.cacheRead ? ' · cache hit' : ''}</span>` : '');
+function staleNoteFor(basedOn, refreshing) {
+  const b = S.board;
+  if (!b || basedOn == null || basedOn >= b.pickCount) return '';
+  const n = b.pickCount - basedOn;
+  return ` <span class="stale">· board moved (${n} newer pick${n > 1 ? 's' : ''}${refreshing ? ', refreshing' : ''})</span>`;
+}
+
+function renderDoneCard(a) {
+  const nameEl = $('pickName'), why = $('adviceWhy'), alts = $('adviceAlts'), alerts = $('adviceAlerts'), stream = $('adviceStream');
+  const b = S.board;
   const p = a.parsed;
+  const taken = b && b.adviceRecTaken && a.basedOn < b.pickCount;
   if (p && p.pick) {
     nameEl.textContent = `${p.pick.name} (${p.pick.position}${p.pick.team ? ', ' + p.pick.team : ''})`;
-    nameEl.className = '';
+    nameEl.className = taken ? 'fallbackTitle' : '';
     why.textContent = p.pick.why || '';
     alts.innerHTML = (p.alternatives || []).map((x) => `<div class="altRow"><b>${esc(x.name)} <span class="pos-${esc(x.position)}">${esc(x.position)}</span></b><span class="muted">${esc(x.why)}</span></div>`).join('');
     alerts.innerHTML =
+      (taken ? '<div class="alert" style="color:var(--bad)">⚠ Recommended player was just taken — alternatives below, fresh advice coming.</div>' : '') +
       (p.tier_alert ? `<div class="alert tier">▲ ${esc(p.tier_alert)}</div>` : '') +
       (p.run_risk ? `<div class="alert run">⚡ ${esc(p.run_risk)}</div>` : '') +
       (p.board_read ? `<div class="alert muted">${esc(p.board_read)}</div>` : '');
     stream.classList.add('hidden');
   } else if (a.pickLine) {
-    nameEl.textContent = a.pickLine; nameEl.className = '';
-    stream.classList.remove('hidden'); stream.textContent = a.text || S.streamBuf;
+    nameEl.textContent = a.pickLine; nameEl.className = taken ? 'fallbackTitle' : '';
+    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = '';
+    stream.classList.remove('hidden'); stream.textContent = a.text || '';
   } else {
     nameEl.textContent = 'Response unparseable — raw output below; fallback board is live.';
     nameEl.className = 'fallbackTitle';
-    stream.classList.remove('hidden'); stream.textContent = a.text || S.streamBuf;
+    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = '';
+    stream.classList.remove('hidden'); stream.textContent = a.text || '';
   }
+}
+
+function renderAdvice() {
+  renderFallback();
+  const b = S.board;
+  const tag = $('adviceTag'), nameEl = $('pickName'), why = $('adviceWhy'), alts = $('adviceAlts'), alerts = $('adviceAlerts'), stream = $('adviceStream');
+  const live = S.live, done = S.lastDone;
+  const clear = () => { why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = ''; stream.classList.add('hidden'); };
+
+  // 1. an active stream that already knows its pick wins
+  if (live && live.phase === 'streaming' && (live.pickLine || /PICK:/.test(S.streamBuf))) {
+    tag.innerHTML = `streaming · based on board as of pick ${live.basedOn}` + staleNoteFor(live.basedOn, false);
+    clear(); stream.classList.remove('hidden');
+    renderStreamDelta();
+    return;
+  }
+  // 2. last completed card (kept visible while newer request thinks)
+  if (done) {
+    const refreshing = !!live && (live.phase === 'reasoning' || live.phase === 'streaming');
+    const doneIsCurrent = b && done.basedOn === b.pickCount;
+    tag.innerHTML = `based on board as of pick ${done.basedOn}${done.mock ? ' · <b>MOCK</b>' : ''}` +
+      staleNoteFor(done.basedOn, refreshing) +
+      (doneIsCurrent && done.timings && done.timings.total ? ` <span class="muted">· ${(done.timings.total / 1000).toFixed(1)}s${done.timings.cacheRead ? ' · cache hit' : ''}</span>` : '') +
+      (live && live.phase === 'error' ? ` <span style="color:var(--bad)">· refresh failed: ${esc(live.error)}</span>` : '') +
+      (refreshing ? ' <span class="reasoning">updating</span>' : '');
+    renderDoneCard(done);
+    return;
+  }
+  // 3. nothing completed yet
+  if (live && live.phase === 'reasoning') {
+    tag.innerHTML = `<span class="reasoning">claude-fable-5 reasoning on board as of pick ${live.basedOn}</span>`;
+    nameEl.textContent = b && b.onClock ? 'Thinking… (fallback board below is live)' : 'Preparing recommendation…';
+    nameEl.className = 'muted'; clear();
+    return;
+  }
+  if (live && live.phase === 'streaming') {
+    tag.innerHTML = `streaming · based on board as of pick ${live.basedOn}`;
+    nameEl.textContent = '…'; nameEl.className = 'muted';
+    clear(); stream.classList.remove('hidden'); renderStreamDelta();
+    return;
+  }
+  if (live && live.phase === 'error') {
+    tag.innerHTML = `<span style="color:var(--bad)">✕ ${esc(live.error)}</span>`;
+    nameEl.textContent = 'Use the fallback board below';
+    nameEl.className = 'fallbackTitle'; clear();
+    return;
+  }
+  nameEl.textContent = b && b.onClock ? 'No recommendation yet — use the fallback board below.' : '—';
+  nameEl.className = b && b.onClock ? 'fallbackTitle' : 'muted';
+  tag.textContent = ''; clear();
 }
 
 function renderStreamDelta() {
   const stream = $('adviceStream');
-  if (S.advice && S.advice.phase === 'streaming') {
-    if (!S.advice.pickLine) {
-      const m = S.streamBuf.match(/PICK:\s*([^\n]+)/);
-      if (m) { $('pickName').textContent = m[1].trim(); $('pickName').className = ''; }
-    }
-    stream.classList.remove('hidden');
-    stream.textContent = S.streamBuf;
-    stream.scrollTop = stream.scrollHeight;
-  }
+  if (!S.live || S.live.phase !== 'streaming') return;
+  const m = S.streamBuf.match(/PICK:\s*([^\n]+)/);
+  const pickLine = S.live.pickLine || (m && m[1].trim());
+  if (pickLine) { $('pickName').textContent = pickLine; $('pickName').className = ''; }
+  stream.classList.remove('hidden');
+  stream.textContent = S.streamBuf;
+  stream.scrollTop = stream.scrollHeight;
 }
 
 function toast(msg, kind) {

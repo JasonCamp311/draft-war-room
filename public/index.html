@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draft War Room</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b23; --panel2:#1c232e; --line:#2a3442;
+    --fg:#e6ebf2; --dim:#8b98a9; --accent:#4da3ff; --good:#3ddc84; --warn:#ffb454;
+    --bad:#ff5d5d; --gold:#ffd75e;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; gap:10px; align-items:center; padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--line); flex-wrap:wrap; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:16px; margin:0 8px 0 0; letter-spacing:.5px; }
+  input,select,button { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 9px; font:inherit; }
+  input:focus,select:focus { outline:1px solid var(--accent); }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:#1e4976; border-color:#2f6db0; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--dim); display:inline-block; }
+  .dot.ok { background:var(--good); } .dot.bad { background:var(--bad); animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.3; } }
+  #statusText { color:var(--dim); font-size:12px; }
+  #clockInfo { margin-left:auto; font-size:13px; color:var(--dim); text-align:right; }
+  #clockInfo b { color:var(--fg); }
+  #clockInfo.onclock b { color:var(--gold); }
+  main { display:grid; grid-template-columns: minmax(340px,1.1fr) minmax(380px,1.3fr) minmax(300px,0.9fr); gap:10px; padding:10px 14px; align-items:start; }
+  @media (max-width:1100px) { main { grid-template-columns:1fr 1fr; } }
+  @media (max-width:760px)  { main { grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:var(--dim); margin:0 0 8px; display:flex; align-items:center; gap:8px; }
+  .banner { border-radius:8px; padding:7px 10px; margin-bottom:8px; font-size:13px; }
+  .banner.warn { background:#3a2c12; border:1px solid #6b5220; color:var(--warn); }
+  .banner.bad  { background:#3a1616; border:1px solid #6b2020; color:var(--bad); }
+  .banner.info { background:#12283a; border:1px solid #20496b; color:var(--accent); }
+  .hidden { display:none !important; }
+
+  /* advice panel */
+  #advicePanel { border-color:#31517a; }
+  #pickName { font-size:26px; font-weight:700; margin:2px 0 2px; min-height:34px; }
+  #pickName.fallbackTitle { color:var(--warn); font-size:16px; }
+  #adviceTag { font-size:12px; color:var(--dim); margin-bottom:6px; }
+  #adviceTag .stale { color:var(--warn); }
+  #adviceWhy { font-size:14px; margin-bottom:8px; }
+  #adviceStream { font:12px/1.5 ui-monospace,Consolas,monospace; color:var(--dim); white-space:pre-wrap; max-height:150px; overflow-y:auto; background:var(--panel2); border-radius:6px; padding:8px; }
+  .reasoning { color:var(--accent); font-style:italic; }
+  .reasoning::after { content:'…'; animation:blink 1.2s infinite; }
+  .altRow { display:flex; gap:8px; padding:4px 0; border-top:1px solid var(--line); font-size:13px; }
+  .altRow b { min-width:150px; }
+  .alert { font-size:13px; margin-top:6px; }
+  .alert.tier { color:var(--gold); } .alert.run { color:var(--warn); }
+  #fallbackBox { margin-top:10px; }
+  #fallbackBox table { width:100%; border-collapse:collapse; font-size:13px; }
+  #fallbackBox td { padding:3px 6px; border-top:1px solid var(--line); }
+  .fbNote { color:var(--dim); font-size:12px; }
+
+  /* rankings */
+  #search { width:130px; }
+  #rankTableWrap { max-height:70vh; overflow-y:auto; }
+  table.rank { width:100%; border-collapse:collapse; font-size:13px; }
+  table.rank th { position:sticky; top:0; background:var(--panel); text-align:left; color:var(--dim); font-weight:600; padding:4px 6px; font-size:11px; }
+  table.rank td { padding:3px 6px; border-top:1px solid var(--line); white-space:nowrap; }
+  table.rank tr:hover td { background:var(--panel2); }
+  .pos-QB { color:#e577e5; } .pos-RB { color:#57d1a3; } .pos-WR { color:#5aa8ff; }
+  .pos-TE { color:#ffb454; } .pos-K { color:#b9c2cf; } .pos-DEF { color:#b9c2cf; }
+  .surv { font-size:11px; color:var(--dim); }
+  .surv.low { color:var(--bad); } .surv.mid { color:var(--warn); }
+  .xbtn { border:none; background:none; color:var(--dim); font-size:13px; padding:1px 5px; }
+  .xbtn:hover { color:var(--bad); }
+  .unmatchedRow td { color:var(--warn); }
+  tr.gone td { text-decoration:line-through; color:var(--dim); }
+
+  /* right column */
+  #rosterList { font-size:13px; } #rosterList div { padding:2px 0; }
+  #needsLine { color:var(--dim); font-size:12px; margin-top:4px; }
+  #picksFeed { max-height:34vh; overflow-y:auto; font-size:13px; }
+  #picksFeed .pk { padding:2px 0; border-top:1px solid var(--line); display:flex; gap:6px; }
+  #picksFeed .pk.mine { color:var(--gold); }
+  #picksFeed .pk .no { color:var(--dim); min-width:36px; }
+  #picksFeed .notInCsv { color:var(--warn); font-size:11px; }
+  #upcoming { font-size:12px; color:var(--dim); }
+  #upcoming div { padding:1px 0; }
+  .muted { color:var(--dim); }
+  #importStats { font-size:12px; color:var(--dim); margin-top:6px; }
+  dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; }
+  #toasts { position:fixed; bottom:14px; right:14px; display:flex; flex-direction:column; gap:6px; z-index:20; }
+  .toast { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent); border-radius:8px; padding:8px 12px; font-size:13px; max-width:340px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>DRAFT WAR ROOM</h1>
+  <input id="draftId" placeholder="Sleeper draft ID" size="20">
+  <select id="mySlot"><option value="">my slot…</option></select>
+  <button id="connectBtn" class="primary">Connect</button>
+  <label><input type="file" id="csvFile" accept=".csv,text/csv" style="display:none">
+    <button id="csvBtn" onclick="document.getElementById('csvFile').click()">Import CSV</button>
+  </label>
+  <span class="dot" id="connDot"></span><span id="statusText">idle</span>
+  <div id="clockInfo"></div>
+</header>
+
+<div id="banners" style="padding:0 14px;"></div>
+
+<main>
+  <section class="panel">
+    <h2>Available board <input id="search" placeholder="filter…"> <span id="availCount" class="muted"></span></h2>
+    <div id="importStats"></div>
+    <div id="rankTableWrap">
+      <table class="rank"><thead><tr>
+        <th>Rk</th><th>T</th><th>Player</th><th>Pos</th><th>Bye</th><th>Proj</th><th>VORP</th><th>Surv</th><th></th>
+      </tr></thead><tbody id="rankBody"></tbody></table>
+    </div>
+  </section>
+
+  <section class="panel" id="advicePanel">
+    <h2>Recommendation <button id="refreshAdvice" title="force a fresh recommendation">↻</button></h2>
+    <div id="adviceTag"></div>
+    <div id="pickName" class="muted">—</div>
+    <div id="adviceWhy"></div>
+    <div id="adviceAlts"></div>
+    <div id="adviceAlerts"></div>
+    <div id="adviceStream" class="hidden"></div>
+    <div id="fallbackBox">
+      <h2>Fallback board (always live, computed locally)</h2>
+      <table><tbody id="fallbackBody"></tbody></table>
+    </div>
+  </section>
+
+  <section style="display:flex; flex-direction:column; gap:10px;">
+    <div class="panel">
+      <h2>My roster</h2>
+      <div id="rosterList" class="muted">—</div>
+      <div id="needsLine"></div>
+    </div>
+    <div class="panel">
+      <h2>Pick feed</h2>
+      <div id="picksFeed" class="muted">no picks yet</div>
+    </div>
+    <div class="panel">
+      <h2>Before my next pick</h2>
+      <div id="upcoming" class="muted">—</div>
+    </div>
+  </section>
+</main>
+<div id="toasts"></div>
+
+<script>
+'use strict';
+// The frontend is a pure renderer: all numbers come from the server.
+const $ = (id) => document.getElementById(id);
+const S = {
+  board: null, rankings: [], rankingsMeta: null, session: null, status: null,
+  advice: null,           // last rendered advice event
+  adviceSeq: -1,          // stale guard: never render a lower seq
+  streamBuf: '',
+  es: null, esOpen: false,
+};
+
+// ---------- SSE ----------
+function connectSSE() {
+  if (S.es) S.es.close();
+  const es = new EventSource('/api/events');
+  S.es = es;
+  es.onopen = () => { S.esOpen = true; renderStatus(); };
+  es.onerror = () => { S.esOpen = false; renderStatus(); };   // EventSource auto-reconnects
+  es.addEventListener('snapshot', (e) => {
+    const d = JSON.parse(e.data);
+    S.board = d.board; S.rankings = d.rankings || []; S.rankingsMeta = d.rankingsMeta;
+    S.session = d.session; S.status = d.status;
+    if (d.session) {
+      if (d.session.draft_id) $('draftId').value = d.session.draft_id;
+      populateSlots(S.board ? S.board.teams : 14, d.session.my_slot);
+    }
+    if (d.advice) { S.adviceSeq = d.advice.seq; S.advice = d.advice; }
+    if (d.adviceInflight && d.adviceInflight.seq > S.adviceSeq) {
+      S.adviceSeq = d.adviceInflight.seq;
+      S.advice = { phase: d.adviceInflight.buffer ? 'streaming' : 'reasoning', ...d.adviceInflight };
+      S.streamBuf = d.adviceInflight.buffer || '';
+    }
+    renderAll();
+  });
+  es.addEventListener('board', (e) => { S.board = JSON.parse(e.data); renderAll(); });
+  es.addEventListener('rankings', (e) => { const d = JSON.parse(e.data); S.rankings = d.rankings; S.rankingsMeta = d.meta; renderRankings(); });
+  es.addEventListener('status', (e) => { S.status = JSON.parse(e.data); renderStatus(); renderBanners(); });
+  es.addEventListener('advice', (e) => {
+    const d = JSON.parse(e.data);
+    if (d.seq !== undefined && d.seq < S.adviceSeq) return;      // stale
+    S.adviceSeq = d.seq !== undefined ? d.seq : S.adviceSeq;
+    if (d.phase === 'reasoning') S.streamBuf = '';
+    S.advice = d;
+    renderAdvice();
+  });
+  es.addEventListener('advice_delta', (e) => {
+    const d = JSON.parse(e.data);
+    if (d.seq < S.adviceSeq) return;
+    S.streamBuf += d.delta;
+    renderStreamDelta();
+  });
+  es.addEventListener('toast', (e) => { const d = JSON.parse(e.data); toast(d.msg); });
+  es.addEventListener('ping', () => {});
+}
+
+// ---------- actions ----------
+async function api(pathname, body) {
+  const r = await fetch(pathname, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
+}
+
+$('connectBtn').onclick = async () => {
+  try {
+    const j = await api('/api/draft', { draft_id: $('draftId').value.trim(), my_slot: Number($('mySlot').value) || null });
+    populateSlots(j.meta.teams, Number($('mySlot').value) || null);
+    toast(`Connected: ${j.meta.teams}-team ${j.meta.type} draft, ${j.meta.rounds} rounds (${j.status})`);
+  } catch (e) { toast('Connect failed: ' + e.message, 'bad'); }
+};
+$('mySlot').onchange = () => { if (S.session && S.session.draft_id) api('/api/slot', { my_slot: Number($('mySlot').value) || null }).catch(() => {}); };
+$('refreshAdvice').onclick = () => api('/api/advise/refresh').catch((e) => toast(e.message, 'bad'));
+$('csvFile').onchange = async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const text = await f.text();
+  try {
+    const meta = await api('/api/rankings', { csvText: text, name: f.name });
+    const st = meta.stats;
+    toast(`Imported ${meta.rows} rows: ${st.exact} exact, ${st.fallback} fallback-matched, ${st.unmatched} unmatched`);
+  } catch (e) { toast('Import failed: ' + e.message, 'bad'); }
+  ev.target.value = '';
+};
+function populateSlots(teams, selected) {
+  const sel = $('mySlot');
+  const cur = selected != null ? String(selected) : sel.value;
+  sel.innerHTML = '<option value="">my slot…</option>' +
+    Array.from({ length: teams || 14 }, (_, i) => `<option value="${i + 1}">slot ${i + 1}</option>`).join('');
+  if (cur) sel.value = cur;
+}
+function mark(pid, drafted) { api('/api/mark', { player_id: pid, drafted }).catch((e) => toast(e.message, 'bad')); }
+function editNote(pid, name) {
+  const existing = (S.session && S.session.notes && S.session.notes[pid]) || '';
+  const note = prompt('Note for ' + name, existing);
+  if (note === null) return;
+  api('/api/note', { player_id: pid, note }).then(() => {
+    if (!S.session.notes) S.session.notes = {};
+    if (note) S.session.notes[pid] = note; else delete S.session.notes[pid];
+    renderRankings();
+  }).catch((e) => toast(e.message, 'bad'));
+}
+
+// ---------- rendering ----------
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+function renderAll() { renderStatus(); renderBanners(); renderClock(); renderRankings(); renderRoster(); renderPicks(); renderUpcoming(); renderAdvice(); }
+
+function renderStatus() {
+  const dot = $('connDot'); const txt = $('statusText');
+  const st = S.status || {};
+  const degraded = S.board && S.board.degraded;
+  if (!S.esOpen) { dot.className = 'dot bad'; txt.textContent = 'reconnecting to server…'; return; }
+  if (degraded) { dot.className = 'dot bad'; txt.textContent = 'Sleeper degraded — retrying (state kept)'; return; }
+  dot.className = 'dot ok';
+  const bits = [];
+  if (st.replay) bits.push('REPLAY');
+  if (st.mockLLM) bits.push('MOCK LLM');
+  if (!st.hasKey && !st.mockLLM) bits.push('NO API KEY');
+  bits.push(S.board ? (S.board.status || 'connected') : 'no draft');
+  txt.textContent = bits.join(' · ');
+}
+
+function renderBanners() {
+  const b = $('banners'); const out = [];
+  const board = S.board;
+  if (S.status && !S.status.hasKey && !S.status.mockLLM) out.push('<div class="banner warn">ANTHROPIC_API_KEY not set — Claude advisor is off; fallback board only.</div>');
+  if (board) {
+    for (const a of board.anomalies || []) out.push(`<div class="banner warn">⚠ ${esc(a)}</div>`);
+    for (const u of board.unmatchedPicks || []) out.push(`<div class="banner bad">⚠ Pick #${u.pick_no}: unknown player id ${esc(u.player_id)} — board may be off by one.</div>`);
+    if (board.unresolvedCsv > 0) out.push(`<div class="banner warn">⚠ ${board.unresolvedCsv} CSV row(s) not matched to Sleeper players — they may not clear the board when picked. Fix or X them manually.</div>`);
+    if (board.status === 'pre_draft') out.push('<div class="banner info">Draft has not started — waiting for Sleeper.</div>');
+    if (board.status === 'complete') out.push('<div class="banner info">Draft complete.</div>');
+  }
+  b.innerHTML = out.join('');
+}
+
+function renderClock() {
+  const el = $('clockInfo'); const b = S.board;
+  if (!b || !b.mySlot) { el.textContent = ''; el.className = ''; return; }
+  if (b.onClock) { el.innerHTML = '<b>YOU ARE ON THE CLOCK</b> — pick #' + b.currentPickNo; el.className = 'onclock'; return; }
+  el.className = '';
+  if (b.picksUntilMine != null && b.status === 'drafting')
+    el.innerHTML = `pick <b>#${b.currentPickNo}</b> R${b.currentRound} · slot ${b.onClockSlot} up · <b>${b.picksUntilMine}</b> until you (#${b.myNextPickNo})`;
+  else if (b.status === 'complete') el.textContent = 'draft complete';
+  else el.textContent = 'waiting…';
+}
+
+function renderRankings() {
+  const body = $('rankBody'); const b = S.board;
+  const meta = S.rankingsMeta;
+  $('importStats').textContent = meta
+    ? `${meta.name} · ${meta.rows} rows · ${meta.stats.exact} exact / ${meta.stats.fallback} fallback / ${meta.stats.unmatched} unmatched`
+    : 'No rankings loaded — Import CSV to begin.';
+  const q = $('search').value.trim().toLowerCase();
+  const avail = b && b.available ? b.available : S.rankings.slice(0, 200);
+  const availSet = new Set(avail.map((r) => r.rank));
+  const shown = q
+    ? S.rankings.filter((r) => (r.name + ' ' + r.pos + ' ' + r.team).toLowerCase().includes(q)).slice(0, 60)
+    : avail.slice(0, 120);
+  $('availCount').textContent = b ? `${b.availableCount} left` : (S.rankings.length ? S.rankings.length + ' loaded' : '');
+  body.innerHTML = shown.map((r) => {
+    const gone = q && !availSet.has(r.rank) && S.board;
+    const cand = b && b.candidates ? b.candidates.find((c) => c.rank === r.rank) : null;
+    const sv = cand ? cand.survival.adj : null;
+    const svCls = sv == null ? '' : (sv < 35 ? 'low' : sv < 70 ? 'mid' : '');
+    const note = S.session && S.session.notes && r.player_id && S.session.notes[r.player_id];
+    return `<tr class="${r.player_id ? '' : 'unmatchedRow'}${gone ? ' gone' : ''}">
+      <td>${r.rank}</td><td>${r.tier != null ? r.tier : ''}</td>
+      <td title="${r.player_id ? esc(r.player_id) + (note ? ' — ' + esc(note) : '') : 'NOT matched to a Sleeper player'}"
+          ondblclick="editNote('${esc(r.player_id || '')}','${esc(r.name)}')">${r.player_id ? '' : '⚠ '}${esc(r.name)}${note ? ' 📝' : ''}</td>
+      <td class="pos-${r.pos}">${r.pos}</td><td>${r.bye != null ? r.bye : ''}</td>
+      <td>${r.proj != null ? r.proj : ''}</td><td>${r.vorp != null ? r.vorp : ''}</td>
+      <td class="surv ${svCls}">${sv != null ? sv + '%' : ''}</td>
+      <td>${gone ? '' : `<button class="xbtn" title="mark drafted (manual override)" onclick="mark('${esc(r.player_id || '')}',true)">✕</button>`}</td>
+    </tr>`;
+  }).join('');
+}
+$('search').oninput = () => renderRankings();
+
+function renderRoster() {
+  const b = S.board;
+  if (!b || !b.mySlot || !b.rosterBySlot) { $('rosterList').textContent = '—'; $('needsLine').textContent = ''; return; }
+  const r = b.rosterBySlot[b.mySlot];
+  $('rosterList').innerHTML = r && r.players.length
+    ? r.players.map((p) => `<div>R${p.round} <span class="pos-${p.pos}">${p.pos}</span> ${esc(p.name)}</div>`).join('')
+    : '<span class="muted">no picks yet</span>';
+  if (b.myNeeds) {
+    const d = b.myNeeds.dedicated;
+    const open = Object.entries(d).filter(([, v]) => v > 0).map(([k, v]) => `${k}×${v}`);
+    if (b.myNeeds.flexOpen) open.push(`FLEX×${b.myNeeds.flexOpen}`);
+    $('needsLine').textContent = open.length ? 'Open starters: ' + open.join(', ') : 'All starters filled — bench/upside phase';
+  }
+}
+
+function renderPicks() {
+  const b = S.board;
+  if (!b || !b.picks || !b.picks.length) { $('picksFeed').innerHTML = '<span class="muted">no picks yet</span>'; return; }
+  $('picksFeed').innerHTML = b.picks.slice(-40).reverse().map((p) =>
+    `<div class="pk${p.mine ? ' mine' : ''}"><span class="no">#${p.pick_no}</span>
+     <span class="pos-${p.pos}">${p.pos}</span> ${esc(p.name)}
+     ${p.rank ? `<span class="muted">rk ${p.rank}</span>` : '<span class="notInCsv">not in CSV</span>'}</div>`
+  ).join('');
+}
+
+function renderUpcoming() {
+  const b = S.board;
+  if (!b || !b.intervening || !b.intervening.length) { $('upcoming').textContent = b && b.onClock ? 'You are up NOW.' : '—'; return; }
+  $('upcoming').innerHTML = b.intervening.map((t) =>
+    `<div>#${t.pick_no} slot ${t.slot}: ${t.targets.map((x) => `<span class="pos-${x.pos}">${x.pos}</span> ${Math.round(x.w * 100)}%`).join(' · ') || 'any'}</div>`
+  ).join('');
+}
+
+function renderFallback() {
+  const b = S.board;
+  $('fallbackBody').innerHTML = b && b.fallback && b.fallback.length
+    ? b.fallback.map((f) => `<tr><td>${f.rank}</td><td class="pos-${f.pos}">${f.pos}</td><td>${esc(f.name)}</td><td class="fbNote">${esc(f.note)}</td></tr>`).join('')
+    : '<tr><td class="muted">import rankings first</td></tr>';
+}
+
+function renderAdvice() {
+  renderFallback();
+  const a = S.advice; const b = S.board;
+  const tag = $('adviceTag'), nameEl = $('pickName'), why = $('adviceWhy'), alts = $('adviceAlts'), alerts = $('adviceAlerts'), stream = $('adviceStream');
+  if (!a) {
+    nameEl.textContent = b && b.onClock ? 'No recommendation yet — use the fallback board below.' : '—';
+    nameEl.className = b && b.onClock ? 'fallbackTitle' : 'muted';
+    tag.textContent = ''; why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = ''; stream.classList.add('hidden');
+    return;
+  }
+  const staleNote = (b && a.basedOn != null && a.basedOn < b.pickCount)
+    ? ` <span class="stale">· board moved (${b.pickCount - a.basedOn} newer pick${b.pickCount - a.basedOn > 1 ? 's' : ''}${a.phase === 'done' ? ', refreshing' : ''})</span>` : '';
+  if (a.phase === 'reasoning') {
+    tag.innerHTML = `<span class="reasoning">claude-fable-5 reasoning on board as of pick ${a.basedOn}</span>${staleNote}`;
+    nameEl.textContent = a.speculative ? 'Preparing recommendation…' : 'Thinking…';
+    nameEl.className = 'muted';
+    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = '';
+    stream.classList.add('hidden'); stream.textContent = '';
+    return;
+  }
+  if (a.phase === 'error') {
+    tag.innerHTML = `<span style="color:var(--bad)">✕ ${esc(a.error)}</span>`;
+    nameEl.textContent = 'Use the fallback board below';
+    nameEl.className = 'fallbackTitle';
+    why.textContent = ''; alts.innerHTML = ''; alerts.innerHTML = ''; stream.classList.add('hidden');
+    return;
+  }
+  if (a.phase === 'streaming') {
+    tag.innerHTML = `streaming · based on board as of pick ${a.basedOn}${staleNote}`;
+    if (a.pickLine) { nameEl.textContent = a.pickLine; nameEl.className = ''; }
+    stream.classList.remove('hidden');
+    renderStreamDelta();
+    return;
+  }
+  // done
+  tag.innerHTML = `based on board as of pick ${a.basedOn}${a.mock ? ' · <b>MOCK</b>' : ''}${staleNote}` +
+    (a.timings && a.timings.total ? ` <span class="muted">· ${(a.timings.total / 1000).toFixed(1)}s${a.timings.cacheRead ? ' · cache hit' : ''}</span>` : '');
+  const p = a.parsed;
+  if (p && p.pick) {
+    nameEl.textContent = `${p.pick.name} (${p.pick.position}${p.pick.team ? ', ' + p.pick.team : ''})`;
+    nameEl.className = '';
+    why.textContent = p.pick.why || '';
+    alts.innerHTML = (p.alternatives || []).map((x) => `<div class="altRow"><b>${esc(x.name)} <span class="pos-${esc(x.position)}">${esc(x.position)}</span></b><span class="muted">${esc(x.why)}</span></div>`).join('');
+    alerts.innerHTML =
+      (p.tier_alert ? `<div class="alert tier">▲ ${esc(p.tier_alert)}</div>` : '') +
+      (p.run_risk ? `<div class="alert run">⚡ ${esc(p.run_risk)}</div>` : '') +
+      (p.board_read ? `<div class="alert muted">${esc(p.board_read)}</div>` : '');
+    stream.classList.add('hidden');
+  } else if (a.pickLine) {
+    nameEl.textContent = a.pickLine; nameEl.className = '';
+    stream.classList.remove('hidden'); stream.textContent = a.text || S.streamBuf;
+  } else {
+    nameEl.textContent = 'Response unparseable — raw output below; fallback board is live.';
+    nameEl.className = 'fallbackTitle';
+    stream.classList.remove('hidden'); stream.textContent = a.text || S.streamBuf;
+  }
+}
+
+function renderStreamDelta() {
+  const stream = $('adviceStream');
+  if (S.advice && S.advice.phase === 'streaming') {
+    if (!S.advice.pickLine) {
+      const m = S.streamBuf.match(/PICK:\s*([^\n]+)/);
+      if (m) { $('pickName').textContent = m[1].trim(); $('pickName').className = ''; }
+    }
+    stream.classList.remove('hidden');
+    stream.textContent = S.streamBuf;
+    stream.scrollTop = stream.scrollHeight;
+  }
+}
+
+function toast(msg, kind) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  if (kind === 'bad') t.style.borderLeftColor = 'var(--bad)';
+  $('toasts').appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
+connectSSE();
+</script>
+</body>
+</html>

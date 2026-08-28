@@ -174,3 +174,21 @@ recommendation keeps streaming server-side and re-attaches on refresh).
     server-side, red warning + alternatives emphasized, fresh request auto-fires.
 12. SSE sockets: error listeners added so a dying client can't throw an
     unhandled 'error' event.
+
+### Review Cycle 2 — dress rehearsal (12s/pick, full 15 rounds, mock LLM at
+### realistic Fable-ish timing: ~4.5-13.5s thinking + streaming)
+
+- **Sleeper outage test (live, mid-run)**: fired 30s of forced 500s via
+  `/control/fail`. Result: PASS — backoff 1s/2s/4s/8s/15s, degraded indicator
+  up, auto-recovery 30s later, no crash, no state loss. Note: picks released
+  during the outage were absorbed in one catch-up poll (including one of my
+  turns) — exactly the desired behavior.
+- Frontend review pass (rendering path during my turn): advice events render
+  directly (no full-page re-render); token deltas touch only the stream node;
+  no requestAnimationFrame anywhere (hidden-tab throttling can't freeze the UI);
+  all 25 DOM ids referenced by the script verified present; inline script
+  syntax-checked with node. Known minor: the note editor uses prompt(), which
+  blocks rendering while open (user-initiated only). Chrome extension was not
+  connected this session, so the interactive browser pass is on the pre-draft
+  checklist rather than done here.
+- (final numbers appended below when the run completes)

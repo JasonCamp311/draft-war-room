@@ -132,6 +132,7 @@ const SUFFIXES = new Set(['jr', 'sr', 'ii', 'iii', 'iv', 'v']);
 function normName(s) {
   const toks = String(s || '').toLowerCase()
     .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/['’]/g, '')                      // Ja'Marr == JaMarr
     .replace(/[^a-z0-9 ]+/g, ' ')
     .split(/\s+/).filter(t => t && !SUFFIXES.has(t));
   // collapse runs of single letters so "A.J." == "AJ" ("a j brown" -> "aj brown")
@@ -1226,6 +1227,11 @@ const server = http.createServer(async (req, res) => {
     try { json(res, 500, { error: e.message }); } catch { /* headers sent */ }
   }
 });
+
+// Pure functions exported for tools/selftest.js; requiring this file does not
+// start the server unless it is the entry point.
+module.exports = { normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST, resolvePlayer, buildNameIndex };
+if (require.main !== module) return;
 
 process.on('uncaughtException', (e) => { warn('uncaughtException:', e.stack || e.message); });
 process.on('unhandledRejection', (e) => { warn('unhandledRejection:', e && (e.stack || e.message || e)); });

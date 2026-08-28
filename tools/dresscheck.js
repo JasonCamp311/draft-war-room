@@ -159,4 +159,4 @@ function report() {
   }).catch(() => process.exit(1));
 }
 
-main().catch((e) => { console.error('dresscheck crashed:', e); process.exit(1); });
+main().catch((e) => { console.error('dresscheck stream ended abnormally:', e.message); problems.push('SSE stream died: ' + e.message); report(); });

@@ -284,3 +284,6 @@ recommendation keeps streaming server-side and re-attaches on refresh).
     on this machine — see session start). The speculation design makes
     time-to-visible independent of model latency in the common case; run the
     Friday checklist replay with the key set to confirm.
+  - **Final clean run: PASS.** 15/15 turns visible at 0-1 ms (all precomputed),
+    kill test fired/surfaced/recovered, zero problems, RSS 56 -> 67 MB,
+    44 requests (16 completed / 23 invalidated-by-design / 5 from the kill).

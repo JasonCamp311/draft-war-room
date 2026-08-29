@@ -266,7 +266,7 @@ const COL_PATTERNS = {
   team: /^(team|tm)$/i,
   pos: /^(pos|position)$/i,
   bye: /^(bye( week)?)$/i,
-  proj: /^(proj|projection|proj pts|fpts|points|proj\.? points)$/i,
+  proj: /^(proj\.?|projection|proj\.?\s*pts\.?|fpts|points|proj\.?\s*points|proj\.?\s*pts)$/i,
   notes: /^(notes?|comment s?)$/i,
 };
 
@@ -692,6 +692,16 @@ function advisorOnBoardChange() {
       else if (inf.pickLine) markVisible('stale-streaming');
       return;
     }
+    // Starvation guard: if picks land faster than requests complete, aborting on
+    // every pick means NOTHING ever completes. A request that is already
+    // streaming, or any request when our newest completed rec is missing/very
+    // stale, runs to completion (then auto-refreshes); freshness only wins when
+    // we already hold a recent rec to fall back on.
+    const latestAge = latest ? b.pickCount - latest.basedOn : Infinity;
+    if (inf.buffer || latestAge > 3) {
+      inf.refreshAfter = true;
+      return;
+    }
     abortInflight('superseded');
   }
   // instant visibility with the last completed rec (tagged stale) while fresh one runs
@@ -797,11 +807,9 @@ function startAdvice(board) {
     broadcast('advice', adviceEvent(rec));
     if (ST.board && ST.board.onClock) markVisible('completed');
     log(`advice #${seq} done (basedOn=${rec.basedOn}, ttft=${lat.ttft}ms, total=${lat.total}ms, cacheRead=${lat.cacheRead})`);
-    // a kept-stale stream finished while on the clock: refresh on the current board
-    const b = ST.board;
-    if (inf.refreshAfter && b && b.onClock && b.status === 'drafting' && b.pickCount !== inf.basedOn && !ST.adv.inflight) {
-      startAdvice(b);
-    }
+    // a kept-stale request finished: re-evaluate — if the board moved and we're
+    // still in the window (or on the clock), the normal rules fire a fresh one.
+    if (inf.refreshAfter && !ST.adv.inflight) advisorOnBoardChange();
   }).catch((e) => {
     clearTimers();
     if (inf.aborted) return;               // deliberate aborts are expected, not errors
@@ -1230,7 +1238,7 @@ const server = http.createServer(async (req, res) => {
 
 // Pure functions exported for tools/selftest.js; requiring this file does not
 // start the server unless it is the entry point.
-module.exports = { normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST, resolvePlayer, buildNameIndex };
+module.exports = { normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST, resolvePlayer, buildNameIndex, COL_PATTERNS };
 if (require.main !== module) return;
 
 process.on('uncaughtException', (e) => { warn('uncaughtException:', e.stack || e.message); });

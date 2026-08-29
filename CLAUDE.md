@@ -23,6 +23,8 @@ claude-fable-5 (extended thinking, streaming, prompt-cached) recommend picks.
 - `tools/make-sample-csv.js` — generates a test rankings CSV from the replay data.
 - `tools/dresscheck.js` — headless client that runs a full replay and verifies the
   latency / matching / stability targets.
+- `tools/selftest.js` — unit assertions over the pure math (snake/reversal order,
+  normalization, CSV parsing, needs model). Run after any change to those.
 - `data/` (gitignored) — `players-cache.json` (24 h TTL), `rankings.json`,
   `session.json`, `replay-data.json`. Deleting `data/` is a full factory reset.
 

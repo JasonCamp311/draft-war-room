@@ -60,6 +60,20 @@ eq(full.flexOpen, 0, 'flex consumed by spill');
 const late = S.rosterNeeds({ QB: 1, RB: 4, WR: 4, TE: 1 }, slots, 14, 15);
 eq(late.weights.K > 0.2 && late.weights.DEF > 0.2, true, 'K/DEF urgent late');
 
+// ---- CSV header detection (real-world header spellings must all hit)
+const headerHits = (header) => {
+  const found = {};
+  for (const [k, re] of Object.entries(S.COL_PATTERNS)) if (re.test(header)) found[k] = true;
+  return Object.keys(found);
+};
+eq(headerHits('PROJ. PTS'), ['proj'], 'FantasyPros "PROJ. PTS"');
+eq(headerHits('FPTS'), ['proj'], 'FPTS');
+eq(headerHits('PLAYER NAME'), ['name'], 'PLAYER NAME');
+eq(headerHits('BYE WEEK'), ['bye'], 'BYE WEEK');
+eq(headerHits('TIERS'), ['tier'], 'TIERS');
+eq(headerHits('RK'), ['rank'], 'RK');
+eq(headerHits('ECR'), ['rank'], 'ECR');
+
 // ---- levenshtein
 eq(S.lev('mahomes', 'mahomes'), 0, 'lev exact');
 eq(S.lev('mahomes', 'mahomez'), 1, 'lev 1');

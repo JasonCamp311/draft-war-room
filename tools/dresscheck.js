@@ -24,10 +24,14 @@ const KILL_SECS = Number(arg('kill-secs', 25));
 
 const turns = [];        // {pickNo, onClockAt, visibleAt, how, priorReady}
 let curTurn = null;
-let advice = null;       // latest advice event
-let adviceSeq = -1;
+// Mirror the frontend's model exactly: a completed card (lastDone) STAYS on
+// screen while a newer request streams (live). Visibility = whatever the user
+// would actually see.
+let lastDone = null;     // latest completed advice (stays rendered)
+let live = null;         // in-progress advice event
+let liveSeq = -1;
 let board = null;
-let killFired = false, killObservedError = false, killRecovered = false;
+let killFired = false, killObservedError = false, killRecovered = false, killUntil = 0;
 const rssSamples = [];
 const problems = [];
 
@@ -50,12 +54,12 @@ function onBoard(b) {
     curTurn = { pickNo: b.currentPickNo, onClockAt: now(), visibleAt: null, how: null, priorReady: false };
     turns.push(curTurn);
     console.log(`ON THE CLOCK: pick #${b.currentPickNo} (round ${b.currentRound}) picks made=${b.pickCount}`);
-    // A completed rec (even one tagged "as of pick N-1") renders instantly —
-    // that is exactly what the UI shows, so it counts as visible.
-    if (advice && advice.phase === 'done') {
+    // A completed rec already rendered (even one tagged "as of pick N-1")
+    // means the user is looking at advice right now: visible at 0ms.
+    if (lastDone) {
       curTurn.priorReady = true;
-      markVisible(advice.basedOn === b.pickCount ? 'speculative-precomputed' : 'stale-precomputed');
-    } else if (advice && advice.phase === 'streaming' && advice.pickLine) {
+      markVisible(lastDone.basedOn === b.pickCount ? 'speculative-precomputed' : 'stale-precomputed');
+    } else if (live && live.phase === 'streaming' && live.pickLine) {
       markVisible('speculative-streaming');
     }
     // fallback board always counts as *something* visible but we track it separately
@@ -67,6 +71,7 @@ function onBoard(b) {
   if (b.anomalies && b.anomalies.length) problems.push(`anomalies: ${b.anomalies.join('; ')}`);
   if (KILL_ROUND && !killFired && b.currentRound >= KILL_ROUND && b.status === 'drafting') {
     killFired = true;
+    killUntil = Date.now() + KILL_SECS * 1000 + 5000;   // +grace for an in-flight request to fail
     console.log(`KILLING LLM for ${KILL_SECS}s (round ${b.currentRound})...`);
     fetch(SERVER + '/api/debug/kill-llm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"on":true}' })
       .then(() => setTimeout(() => {
@@ -77,19 +82,23 @@ function onBoard(b) {
 }
 
 function onAdvice(d) {
-  if (d.seq !== undefined) { if (d.seq < adviceSeq) return; adviceSeq = d.seq; }
-  advice = d;
+  if (d.phase === 'done') {
+    if (lastDone && d.seq < lastDone.seq) return;             // out-of-order done
+    lastDone = d;
+    if (live && live.seq <= d.seq) live = null;
+    if (killFired && killObservedError && Date.now() >= killUntil - 5000) killRecovered = true;
+    if (curTurn) markVisible('completed');
+    return;
+  }
+  if (d.seq !== undefined) { if (d.seq < liveSeq) return; liveSeq = d.seq; }
+  live = d;
   if (d.phase === 'error') {
-    if (killFired && !killRecovered) { killObservedError = true; console.log(`  advisor error surfaced (expected during kill): ${d.error}`); }
+    if (killFired && Date.now() < killUntil) { killObservedError = true; console.log(`  advisor error surfaced (expected during kill): ${d.error}`); }
     else problems.push(`unexpected advisor error: ${d.error}`);
-    if (curTurn) markVisible('fallback-after-error');
+    // the UI keeps showing lastDone (or the fallback board) — still visible
+    if (curTurn) markVisible(lastDone ? 'stale-precomputed' : 'fallback-after-error');
   }
   if (d.phase === 'streaming' && d.pickLine && curTurn) markVisible('streaming-pickline');
-  if (d.phase === 'done' && curTurn) {
-    if (killFired && killObservedError) killRecovered = true;
-    markVisible('completed');
-  }
-  if (d.phase === 'done' && killFired && killObservedError && !killRecovered) killRecovered = true;
 }
 
 async function sampleStats() {
@@ -123,7 +132,11 @@ async function main() {
       }
       if (!data) continue;
       let j; try { j = JSON.parse(data); } catch { continue; }
-      if (event === 'snapshot') { if (j.advice) onAdvice(j.advice); onBoard(j.board); }
+      if (event === 'snapshot') {
+        if (j.advice) onAdvice(j.advice);
+        if (j.adviceInflight) { liveSeq = j.adviceInflight.seq; live = { phase: 'streaming', ...j.adviceInflight }; }
+        onBoard(j.board);
+      }
       else if (event === 'board') onBoard(j);
       else if (event === 'advice') onAdvice(j);
       if (board && board.status === 'complete') { done = true; break; }

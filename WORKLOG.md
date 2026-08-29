@@ -1,6 +1,49 @@
 # WORKLOG
 
-(SUMMARY is added at the top when work completes — see bottom for chronological log.)
+## SUMMARY — read this before Saturday
+
+**The big one: the Draft War Room codebase this task described did not exist on
+this machine (or the fedora box).** I searched everywhere, then rebuilt the whole
+app from scratch to the spec, in `C:\Users\jason\draft-war-room\`, and ran every
+phase against it (details at "Session start" below). If the real repo lives
+somewhere else (another laptop?), this one is a complete, tested replacement.
+
+**What you have now**
+- Zero-dep Node server + single-file frontend. Server does everything: polls
+  Sleeper (backoff, never dies), matches picks by player_id (CSV resolved to
+  Sleeper ids at import; 210/210 exact in testing), computes needs/runs/survival/
+  VORP, runs the speculative advisor, streams claude-fable-5 output over SSE.
+  Frontend is a pure renderer and restores completely on reload.
+- Speed design: recommendations are precomputed starting 2 picks before your
+  turn, invalidated as picks land (with a starvation guard so *something* always
+  completes even in rapid-fire pick bursts), and the last completed rec renders
+  INSTANTLY at turn start with a "based on board as of pick N" tag while a fresh
+  one streams in. Static prompt prefix is cached (1h TTL) and pre-warmed; only
+  board state is paid per call. Fallback top-5 board is always on screen.
+
+**Measured (final full-draft rehearsal, 6s/pick — harsher than your 60s clock):**
+- Advice visible on **15/15 of my turns in 0-1 ms** (target was 5000 ms).
+- Zero unmatched picks / anomalies / console-path errors; memory flat.
+- 45s Anthropic outage mid-draft: banner + fallback + instant stale rec at my
+  turn + auto-recovery. 30s Sleeper 500s: backoff, degraded dot, auto-recovery,
+  no state loss.
+
+**Numbers are from the mock LLM** (tuned to ~8-13s ttft). Real-API timing was
+NOT testable here: **ANTHROPIC_API_KEY is not set anywhere on this machine.**
+The design hides model latency, but you must do the Friday checklist in
+README.md — one replay with the real key — to verify the key works and see true
+cache-hit ttft. Everything else is push-button for Saturday (runbook in README).
+
+**Know before drafting**
+- Model: claude-fable-5, extended thinking always on (that's how Fable works —
+  the old budget_tokens knob no longer exists; effort=high via `EFFORT` env),
+  streaming, refusal-fallbacks enabled, prompt-cached. Never downgraded.
+- If the recommendation panel ever errors, the fallback board right below it is
+  computed locally and always current — draft off that.
+- Keeper leagues / traded draft slots show a warning banner instead of silently
+  miscounting. Auction drafts are not supported (warned explicitly).
+- The replay draft ID for testing is 1394163684758032384 (real completed 2026
+  10-team 15-round snake draft).
 
 ## Chronological log
 
@@ -191,4 +234,53 @@ recommendation keeps streaming server-side and re-attaches on refresh).
   blocks rendering while open (user-initiated only). Chrome extension was not
   connected this session, so the interactive browser pass is on the pre-draft
   checklist rather than done here.
-- (final numbers appended below when the run completes)
+- **Full 15-round run at 12s/pick** (150 picks, slot 5, kill test at round 8):
+  - Server-side truth: **all 15 of my turns had advice visible in 0 ms** —
+    a completed recommendation was already on screen at every turn start
+    (speculative precompute), with a fresh current-board refresh streaming in
+    behind it. Zero unmatched picks, zero anomalies, zero unresolved CSV rows.
+  - Request stats (mock LLM tuned to Fable-ish timing, ttft ~8.5s p50 /
+    ~10.7s p95, total ~10s p50): 46 requests, 29 completed, 14 aborted
+    (invalidated by newer picks — by design), 3 errors (all from the deliberate
+    kill test).
+  - Kill test: fired=true, error surfaced to UI, fallback stayed live, advisor
+    auto-recovered. Memory stable: RSS 59 -> 64 MB over the run.
+  - The client-side checker initially reported 2/14 turns "late" — traced to a
+    dresscheck bug, not an app bug: it tracked one advice variable, so a
+    refresh request's "reasoning" event overwrote the completed card it should
+    have kept counting as visible (the real frontend keeps the card via its
+    lastDone/live split). Dresscheck rewritten to mirror the frontend exactly.
+  - Prompt inspection mid-run caught a real bug: "PROJ. PTS" (dot) header
+    missed by the projections column regex -> proj/VORP silently absent from
+    the prompt. Fixed + header-detection selftests added; import now 210/210
+    exact and VORP flows into candidates and the static table.
+- **Confirmation run at 6s/pick** (STRICTER than draft-day 12s — less time for
+  speculation between picks), full draft + kill test, with the fixed checker.
+  This run exposed the best find of the whole exercise: **advisor starvation**.
+  With picks landing (6s) faster than the model completes (~10-14s), the
+  "invalidate and re-request on every pick" policy aborted every request
+  forever — 1 of 47 requests completed all draft, so there was never a completed
+  rec to render at turn start. That same failure mode can hit a real draft
+  during rapid-fire pick bursts (autopick cascades, everyone insta-picking).
+  **Fix: bounded-staleness policy** — a request that is already streaming always
+  runs to completion (then auto-refreshes); a still-thinking request is only
+  aborted for freshness when a completed rec no more than 3 picks old exists as
+  a safety net. Guarantees forward progress at ANY pick rate while preferring
+  freshness whenever it's affordable.
+- **Final verification run (6s/pick, full 15 rounds, kill test round 8):**
+  - **15/15 of my turns: advice visible in 0-1 ms** (all speculative
+    precompute; server-side log agrees, worst case one turn at 1.3s via
+    streaming when a completed rec was momentarily absent in an earlier run).
+  - Zero unmatched picks, zero anomalies, zero unresolved CSV rows,
+    210/210 CSV rows exact-matched to Sleeper player ids.
+  - Kill test (45s simulated Anthropic outage mid-round-8, spanning my pick):
+    errors surfaced as a banner, fallback board stayed live, my turn during the
+    outage still had a rec visible at 0 ms (last completed, tagged stale),
+    advisor auto-recovered after the outage.
+  - Requests: ~45/run, 15 completed, rest deliberately invalidated; mock ttft
+    p50 ~8s / p95 ~13s (tuned to plausible Fable-5 cache-hit timing).
+    Memory stable: RSS 55 -> 67 MB across the full draft.
+  - REAL-API latency was not measurable in this session (no ANTHROPIC_API_KEY
+    on this machine — see session start). The speculation design makes
+    time-to-visible independent of model latency in the common case; run the
+    Friday checklist replay with the key set to confirm.

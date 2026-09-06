@@ -431,3 +431,19 @@ to draft; draft paths untouched except 4 backward-compatible seams).
 - ESPN cookies: a league without its own borrows another league's (same account).
 - Verified: selftest 153; tools/league-dresscheck.js 19/19 against the ESPN mock
   (isolation, background polling, watcher wake + submit routed per league).
+
+## 2026-09-06 (draft night) — real ESPN league, browser relay, durable advisor loop
+
+- Real league doc (Acture 2026, 8-team PPR) exposed two things the mock could not:
+  every pick row pre-exists with playerId -1 (fixed: not a pick), and espn_s2 is
+  HttpOnly so no page script can read it. Solution = **browser relay**: a logged-in
+  ESPN tab fetches the league doc with its own cookies and POSTs it to
+  `/api/espn/relay` (CORS limited to espn.com origins + Chrome private-network
+  headers; Chrome still asks the user once to Allow local-network access).
+- Hidden tabs throttle timers to 1/min (observed: 41s gaps), so the relay is paced
+  by the server: `/api/espn/relay/ticks` SSE stream, 3s ticks, fetch-on-tick, 20s
+  timer fallback. Observed steady 3s pushes with the tab hidden.
+- Claude Code background shells die after minutes (exit 127) — the advisor loop
+  now runs `tools/advisor-loop.js` under a persistent Monitor: one JSON line per
+  wake (with `league`), waits for the submit before re-arming.
+- `/api/rankings/copy` reuses another league's CSV. Pre-baked round-1 rec for slot 6.

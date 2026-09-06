@@ -69,6 +69,11 @@ Three advisor sources (`ADVISOR` auto-detected, overridable):
   loads it and disables season polling — how season features are tested off-season.
 - `tools/make-sample-csv.js` — generates a test rankings CSV from the replay data.
 - `tools/espn-probe.js` — dumps + converts a real ESPN league (run before an ESPN draft night).
+- `tools/espn-relay.js` — prints the browser snippet for private ESPN leagues without cookies:
+  a logged-in ESPN tab fetches the league doc and POSTs it to `/api/espn/relay`, paced by the
+  server's `/api/espn/relay/ticks` SSE stream (hidden-tab timers are throttled; SSE is not).
+- `tools/advisor-loop.js` — long-lived wrapper around advisor-watch for a Claude session: one
+  compact JSON line per wake (carries `league`), waits for the submit before re-arming.
 - `tools/league-dresscheck.js` — multi-league e2e against the ESPN mock: create league, connect,
   isolation from main, watcher wake with `league`, submit `--league`, background polling, remove.
 - `tools/espn-mock.js` + `tools/espn-fixture.js` — synthetic ESPN API for rehearsals

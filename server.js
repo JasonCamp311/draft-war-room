@@ -2843,6 +2843,21 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'application/json', ...cors });
       return res.end(JSON.stringify({ ok: true, leagues: targets.map(c => c.id), picks: ((body.raw.draftDetail || {}).picks || []).filter(x => x && x.playerId != null && x.playerId !== 0 && x.playerId !== -1).length }));
     }
+    if (p === '/api/espn/relay/ticks') {
+      // Server-driven cadence for the browser relay: Chrome throttles timers in hidden
+      // tabs (down to once a minute), but events arriving on an open stream are not
+      // throttled — so the page fetches ESPN when WE say so, every ESPN_POLL_MS.
+      const origin = req.headers.origin || '';
+      const cors = /^https:\/\/([a-z0-9-]+\.)*espn\.com$/i.test(origin) ? { 'access-control-allow-origin': origin, 'access-control-allow-private-network': 'true', 'access-control-allow-local-network': 'true' } : {};
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive', ...cors });
+      res.write('retry: 2000\n\n');
+      const period = Math.max(2000, Number(url.searchParams.get('every')) || ESPN_POLL_MS);
+      const t = setInterval(() => sseWrite(res, 'tick', { t: Date.now(), every: period }), period);
+      sseWrite(res, 'tick', { t: Date.now(), every: period });
+      const stop = () => clearInterval(t);
+      req.on('close', stop); req.on('error', stop); res.on('error', stop);
+      return;
+    }
     if (p === '/api/espn/relay/status') {
       const r = ctx.espnRelay;
       return json(res, 200, { league_id: r ? r.league_id : null, ageSec: r ? Math.round((Date.now() - r.at) / 1000) : null, fresh: !!(r && Date.now() - r.at < RELAY_FRESH_MS) });

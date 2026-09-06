@@ -160,6 +160,18 @@ in `data/session.json` (gitignored, never sent to the browser) and survive
 resets. Alternatively set `ESPN_S2` / `ESPN_SWID` env vars. They expire after
 a long time but do re-copy them if Connect returns 401/403.
 
+**No-cookie alternative: the browser relay.** `espn_s2` is an HttpOnly cookie,
+so a page script can't read it — but a logged-in ESPN tab can fetch the league
+document itself and hand it to the war room. Run
+`node tools/espn-relay.js --league <leagueId>` and paste the printed snippet into
+the DevTools console of an ESPN tab (the bare API URL
+`lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/<yr>/segments/0/leagues/<id>`
+is the best host page — ESPN's real pages are heavy). It pushes the document to
+`POST /api/espn/relay` every 3 s; the server prefers a fresh relay copy over the
+API and flags it stale if the tab dies. Chrome asks once whether the site may
+access your local network (localhost) — click **Allow**. Leave that tab open for
+the draft. Then connect the league in the UI as usual (cookie fields blank).
+
 **Before draft night, probe the league** — this is the one part that can only be
 verified against your real league:
 

@@ -3,7 +3,7 @@
 /*
  * Delivers external-advisor output to the war-room server.
  *
- *   node tools/advisor-submit.js --based-on 63 --file advice.txt [--server ...]
+ *   node tools/advisor-submit.js --based-on 63 --file advice.txt [--server ...] [--league <id>]
  *   ... | node tools/advisor-submit.js --based-on 63
  *
  * SEASON kinds (lineup|waiver|trade|matchup|power):
@@ -22,6 +22,7 @@ const args = process.argv.slice(2);
 const arg = (n, d) => { const i = args.indexOf('--' + n); return i !== -1 ? args[i + 1] : d; };
 const SERVER = arg('server', 'http://localhost:8484');
 const FILE = arg('file', null);
+const LEAGUE = arg('league', null);          // which league (id from advisor-watch output); default = server's active league
 
 (async () => {
   const text = FILE ? fs.readFileSync(FILE, 'utf8') : fs.readFileSync(0, 'utf8');
@@ -32,9 +33,9 @@ const FILE = arg('file', null);
   if (kind) body.kind = kind;
   const token = arg('based-on-token', null);
   if (token) body.basedOn = token;
-  const r = await fetch(`${SERVER}/api/advisor/submit`, {
+  const r = await fetch(`${SERVER}/api/advisor/submit${LEAGUE ? '?league=' + encodeURIComponent(LEAGUE) : ''}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...(LEAGUE ? { 'x-league': LEAGUE } : {}) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(10000),
   });

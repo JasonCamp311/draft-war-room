@@ -52,23 +52,32 @@ factory reset.
 
 ### Several leagues at once
 
-One server = one league. For more, run one server per league, each with a
-**profile** and its own port. Profiles keep their own session, rankings, notes
-and advice under `data/profiles/<name>/`; the 5 MB player caches are shared.
+One server holds **all your leagues**. The dropdown in the header switches
+between them; **＋** adds one, **✎** renames it, **✕** removes it from the list
+(its files stay on disk). Every league has its own draft/league connection,
+rankings CSV, notes, manual marks and advice history, and every connected
+league keeps polling in the background, so switching is instant and nothing is
+missed while you're looking at another one. The dropdown shows each league's
+live state (pre-draft / drafting · N until you / ⏰ ON THE CLOCK / season) and a
+🧠 when it is waiting on advice.
 
-```powershell
-node server.js                                  # default league  -> http://localhost:8484
-node server.js --profile work  --port 8485      # second league   -> http://localhost:8485
-node server.js --profile bros  --port 8486      # third league    -> http://localhost:8486
-```
+Typical setup: your season-long Sleeper league in the first entry, then ＋ for
+each draft you have coming up (Sleeper or ESPN), connected in advance. Names
+fill in automatically from the platform once connected.
 
-The header shows the profile name so the tabs are easy to tell apart. Connect a
-different Sleeper draft / ESPN league in each, import that league's rankings,
-done. A Claude Code advisor session can serve several at once by pointing the
-tools at each server: `node tools/advisor-watch.js --server http://localhost:8485`
-and `node tools/advisor-submit.js --server http://localhost:8485 …`. Switching a
-single server to a different league is just Connect again with the new
-ID — the previous draft's state is replaced. Sleeper's API is read-only, so nothing here can change your
+Under the hood the original league keeps `data/` itself (so existing installs
+upgrade in place) and each added league lives under `data/leagues/<id>/`;
+`data/leagues.json` is the registry. Every API call takes `?league=<id>` or an
+`x-league` header; without one the server's **default** league is used (the one
+`POST /api/leagues/active` names, initially the original). The advisor tools
+follow suit: `tools/advisor-watch.js` with no `--league` scans **all** leagues
+and wakes for whichever needs a pick first (its output carries `league`), and
+`tools/advisor-submit.js --league <id>` delivers to that league. Pin a watcher to
+one league with `--league <id>`.
+
+Prefer separate servers anyway (different ports, different machines)? Profiles
+still exist: `node server.js --profile bros --port 8486` keeps that server's
+leagues under `data/profiles/bros/`. Sleeper's API is read-only, so nothing here can change your
 league — lineup and waiver moves are still made in the Sleeper app.
 
 ---

@@ -408,3 +408,26 @@ to draft; draft paths untouched except 4 backward-compatible seams).
   each poll, on-clock + `needAdvice` fired at my turn. `tools/espn-probe.js`
   is the pre-draft check against the real league (field names confirmed only
   against the mock so far — run the probe before the draft).
+
+## 2026-09-06 (later) — one server, many leagues
+
+- Jason has many leagues and wants to swap between them in ONE app, all connected
+  at once. Profiles (one server per league) shipped first as a stopgap; then the
+  real thing: league CONTEXTS. `ST.<key>` became accessors onto the active context
+  (`Object.defineProperty`), so ~all existing code is untouched; the discipline is
+  `activate(ctx)` at the top of every handler/poll loop and after every await
+  (Node is single-threaded, so that is sufficient), captured ctx in timer/promise
+  callbacks, `withCtx()` for sync work on another league.
+- Registry data/leagues.json (sync-written); `main` keeps data/ (in-place upgrade),
+  others under data/leagues/<id>/. `saveJson` keys its debounce by dir+name and
+  captures the dir at call time.
+- Routes: GET/POST /api/leagues, /api/leagues/{rename,active,remove}. Every call
+  takes ?league= / x-league; snapshot carries league + leagues; `leagues` SSE
+  event goes to all viewers (also piggybacks the 15s ping).
+- UI: header dropdown (name + live state + 🧠), ＋/✎/✕; per-league localStorage
+  choice; switching reconnects SSE and clears per-league view state.
+- Tools: advisor-watch with no --league scans /api/leagues and wakes for the
+  first league needing a pick (output has `league`); advisor-submit --league.
+- ESPN cookies: a league without its own borrows another league's (same account).
+- Verified: selftest 153; tools/league-dresscheck.js 19/19 against the ESPN mock
+  (isolation, background polling, watcher wake + submit routed per league).

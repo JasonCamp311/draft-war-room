@@ -344,5 +344,27 @@ S.ST.players.r1.inj = '';
   eq(S.sessionView().espn.hasCookies, false, 'session view hides cookies');
 }
 
+// ---- multi-league contexts: ST.<key> is an accessor onto the active league
+{
+  const main = S.ST.ctx;
+  const other = S.newCtx('t1', require('path').join(__dirname, '..', 'data', 'leagues', '_selftest'), 'Test League');
+  eq(S.leagueName(other), 'Test League', 'custom name');
+  other.name = null;
+  eq(S.leagueName(other), 'New league', 'auto name for an empty league');
+  main.board = { status: 'drafting', mySlot: 1 };
+  S.withCtx(other, () => { S.ST.board = { status: 'pre_draft', mySlot: 9 }; S.ST.session.draft_id = 'espn:1'; S.ST.session.source = 'espn'; S.ST.session.espn.league_id = '1'; });
+  eq(S.ST.ctx, main, 'withCtx restores the previous league');
+  eq(S.ST.board.mySlot, 1, 'main board untouched by the other league');
+  eq(other.board.mySlot, 9, 'other league kept its own board');
+  eq(S.leagueName(other), 'ESPN 1', 'auto name from the ESPN connection');
+  S.activate(other);
+  eq(S.ST.session.draft_id, 'espn:1', 'activate switches ST.session');
+  S.activate(main);
+  eq(S.ST.session.draft_id === 'espn:1', false, 'main session is its own');
+  eq(S.leagueView(other).source, 'espn', 'league view reads the other league');
+  eq(S.ST.ctx, main, 'leagueView leaves the active league alone');
+  try { require('fs').rmSync(other.dir, { recursive: true, force: true }); } catch { /* fine */ }
+}
+
 console.log(`\nselftest: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

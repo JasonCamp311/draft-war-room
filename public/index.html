@@ -35,6 +35,9 @@
   header { display:flex; gap:14px; align-items:center; padding:10px 16px 8px; flex-wrap:wrap; position:sticky; top:0; z-index:5;
     background:linear-gradient(180deg,rgba(6,1,20,.95),rgba(11,2,32,.85));
     border-bottom:1px solid rgba(255,45,149,.35); box-shadow:0 8px 32px rgba(255,45,149,.10); }
+  #leagueBar { display:flex; gap:4px; align-items:center; }
+  #leagueBar select { max-width:220px; font-weight:600; }
+  #leagueBar button { padding:2px 7px; min-width:0; }
   header h1 { font-family:'Monoton',var(--disp); font-weight:400; font-size:22px; margin:0 10px 0 0; letter-spacing:3px; color:var(--pink);
     text-shadow:0 0 8px rgba(255,45,149,.9), 0 0 28px rgba(255,45,149,.55), 0 0 64px rgba(255,45,149,.35); white-space:nowrap; }
   input,select,button { background:var(--panel2); color:var(--fg); border:1px solid var(--line); border-radius:0; padding:5px 10px; font:inherit; font-weight:600; }
@@ -235,6 +238,12 @@
 <div id="scanlines" aria-hidden="true"></div>
 <header>
   <h1>WAR ROOM</h1>
+  <div id="leagueBar" title="Switch between your connected leagues">
+    <select id="leagueSel"></select>
+    <button id="leagueAdd" title="Add another league">＋</button>
+    <button id="leagueRename" title="Rename this league">✎</button>
+    <button id="leagueRemove" title="Remove this league from the list">✕</button>
+  </div>
   <nav id="tabs">
     <button data-tab="dashboard">Dashboard</button>
     <button data-tab="lineup">Lineup</button>
@@ -411,20 +420,77 @@ const S = {
   tab: null,
 };
 
+// ---------- leagues (one server, many leagues; this page shows ONE at a time) ----------
+S.league = null;            // id of the league this page is showing
+S.leagues = [];             // [{id, name, source, draftStatus, ...}] from the server
+try { S.league = localStorage.getItem('warroom.league') || null; } catch { /* private mode */ }
+function leagueQuery(sep) { return S.league ? `${sep}league=${encodeURIComponent(S.league)}` : ''; }
+function renderLeagues() {
+  const sel = $('leagueSel');
+  const cur = S.league;
+  sel.innerHTML = S.leagues.map((l) => {
+    const flags = [l.source === 'espn' ? 'ESPN' : 'Sleeper', l.draftStatus === 'drafting' ? (l.onClock ? '⏰ ON THE CLOCK' : `drafting · ${l.picksUntilMine != null ? l.picksUntilMine + ' until you' : ''}`) : (l.draftStatus === 'pre_draft' ? 'pre-draft' : (l.seasonConnected ? 'season' : (l.draftStatus === 'complete' ? 'drafted' : 'not connected')))];
+    if (l.needAdvice || (l.seasonPending && l.seasonPending.length)) flags.push('🧠');
+    return `<option value="${esc(l.id)}">${esc(l.name)} — ${esc(flags.filter(Boolean).join(' · '))}</option>`;
+  }).join('');
+  if (cur && S.leagues.some((l) => l.id === cur)) sel.value = cur;
+  const me = S.leagues.find((l) => l.id === S.league);
+  if (me) document.title = me.name + ' · War Room';
+  $('leagueRemove').disabled = !me || me.id === 'main';
+}
+function switchLeague(id) {
+  S.league = id;
+  try { localStorage.setItem('warroom.league', id); } catch { /* private mode */ }
+  // drop the old league's view state; the new snapshot repaints everything
+  S.board = null; S.rankings = []; S.rankingsMeta = null; S.session = null; S.lastDone = null; S.live = null; S.streamBuf = '';
+  S.season = null; S.seasonAdvice = {}; S.seasonPending = {}; S.trade = { give: new Set(), get: new Set(), partner: null, eval: null };
+  $('draftId').value = ''; $('leagueId').value = ''; $('espnSeason').value = '';
+  connectSSE();
+}
+$('leagueSel').onchange = () => switchLeague($('leagueSel').value);
+$('leagueAdd').onclick = async () => {
+  const name = prompt('Name for the new league (optional — it auto-names once connected):', '');
+  if (name === null) return;
+  try {
+    const j = await api('/api/leagues', { name });
+    switchLeague(j.league.id);
+    toast('League added — connect a draft or a Sleeper league in it.');
+    showTab('draft');
+  } catch (e) { toast('Add failed: ' + e.message, 'bad'); }
+};
+$('leagueRename').onclick = async () => {
+  const me = S.leagues.find((l) => l.id === S.league);
+  const name = prompt('League name (blank = auto):', me ? me.name : '');
+  if (name === null) return;
+  try { await api('/api/leagues/rename', { id: S.league, name }); } catch (e) { toast('Rename failed: ' + e.message, 'bad'); }
+};
+$('leagueRemove').onclick = async () => {
+  const me = S.leagues.find((l) => l.id === S.league);
+  if (!me || me.id === 'main') return;
+  if (!confirm(`Remove "${me.name}" from the list? Its files stay on disk; polling stops.`)) return;
+  try { await api('/api/leagues/remove', { id: me.id }); switchLeague('main'); } catch (e) { toast('Remove failed: ' + e.message, 'bad'); }
+};
+
 // ---------- SSE ----------
 function connectSSE() {
   if (S.es) S.es.close();
-  const es = new EventSource('/api/events');
+  const es = new EventSource('/api/events' + leagueQuery('?'));
   S.es = es;
   es.onopen = () => { S.esOpen = true; renderStatus(); };
   es.onerror = () => { S.esOpen = false; renderStatus(); };   // EventSource auto-reconnects
+  es.addEventListener('leagues', (e) => { const d = JSON.parse(e.data); S.leagues = d.leagues; renderLeagues(); });
+  es.addEventListener('league_removed', () => { toast('This league was removed — switching to main.'); switchLeague('main'); });
   es.addEventListener('snapshot', (e) => {
     const d = JSON.parse(e.data);
+    if (d.league) {
+      if (S.league !== d.league.id) { S.league = d.league.id; try { localStorage.setItem('warroom.league', S.league); } catch { /* private mode */ } }
+      S.leagues = (d.leagues && d.leagues.leagues) || []; renderLeagues();
+    }
     S.board = d.board; S.rankings = d.rankings || []; S.rankingsMeta = d.rankingsMeta;
     S.session = d.session; S.status = d.status;
     if (d.session) {
       applySessionToForm(d.session);
-      if (d.session.league_id) $('leagueId').value = d.session.league_id;
+      $('leagueId').value = d.session.league_id || '';
       populateSlots(S.board ? S.board.teams : 14, d.session.my_slot, S.board ? S.board.slotNames : null);
     }
     S.lastDone = d.advice || null;
@@ -489,7 +555,9 @@ function connectSSE() {
 
 // ---------- actions ----------
 async function api(pathname, body) {
-  const r = await fetch(pathname, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+  const headers = { 'content-type': 'application/json' };
+  if (S.league) headers['x-league'] = S.league;          // every action targets the league this page shows
+  const r = await fetch(pathname, { method: 'POST', headers, body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
   return j;
@@ -503,10 +571,11 @@ function applySessionToForm(s) {
   $('draftId').placeholder = src === 'espn' ? 'ESPN league ID' : 'Sleeper draft ID';
   if (src === 'espn') {
     const e = s.espn || {};
-    if (e.league_id) $('draftId').value = e.league_id;
-    if (e.season) $('espnSeason').value = e.season;
-    if (e.hasCookies) { $('espnS2').placeholder = 'espn_s2 (saved ✓ — blank keeps it)'; $('espnSwid').placeholder = 'SWID (saved ✓)'; }
-  } else if (s.draft_id) $('draftId').value = s.draft_id;
+    $('draftId').value = e.league_id || '';
+    $('espnSeason').value = e.season || '';
+    $('espnS2').placeholder = e.hasCookies ? 'espn_s2 (saved ✓ — blank keeps it)' : 'espn_s2 cookie (private leagues)';
+    $('espnSwid').placeholder = e.hasCookies ? 'SWID (saved ✓)' : 'SWID cookie {…}';
+  } else $('draftId').value = s.draft_id || '';
 }
 $('source').onchange = () => {
   const espn = $('source').value === 'espn';
@@ -541,7 +610,7 @@ $('mySlot').onchange = () => {
 $('refreshAdvice').onclick = () => api('/api/advise/refresh').catch((e) => toast(e.message, 'bad'));
 $('copyPrompt').onclick = async () => {
   try {
-    const r = await fetch('/api/advisor/context?prompt=1&full=1');
+    const r = await fetch('/api/advisor/context?prompt=1&full=1' + leagueQuery('&'));
     const j = await r.json();
     if (!j.prompt) throw new Error(j.rankingsLoaded ? 'no live board yet — connect a draft first' : 'import rankings first');
     const text = (j.briefing ? j.briefing + '\n\n---\n\n' : '') + j.prompt;
@@ -601,7 +670,7 @@ function renderStatus() {
   if (degraded) { dot.className = 'dot bad'; txt.textContent = provider() + ' degraded — retrying (state kept)'; return; }
   dot.className = 'dot ok';
   const bits = [];
-  if (st.profile) { bits.push(st.profile.toUpperCase()); document.title = st.profile + ' · War Room'; document.querySelector('header h1').textContent = 'WAR ROOM · ' + st.profile; }
+  if (st.profile) { bits.push(st.profile.toUpperCase()); document.querySelector('header h1').textContent = 'WAR ROOM · ' + st.profile; }
   if (st.replay) bits.push('REPLAY');
   if (st.advisor === 'external') bits.push('CLAUDE ADVISOR');
   else if (st.mockLLM) bits.push('MOCK LLM');
@@ -921,7 +990,7 @@ async function copySeasonPrompt(kind) {
       const params = tradeParams() || { mode: 'scan' };
       extra = '&params=' + encodeURIComponent(JSON.stringify(params));
     }
-    const r = await fetch(`/api/advisor/context?kind=${kind}&prompt=1&full=1${extra}`);
+    const r = await fetch(`/api/advisor/context?kind=${kind}&prompt=1&full=1${extra}${leagueQuery('&')}`);
     const j = await r.json();
     if (!j.prompt) throw new Error('no data yet — connect a league and pick your team first');
     const text = (j.briefing ? j.briefing + '\n\n---\n\n' : '') + j.prompt;

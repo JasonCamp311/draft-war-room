@@ -76,7 +76,8 @@ async function fetchJson(url, opts = {}, timeoutMs = 15000) {
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function loadJson(name, fallback, dir = DATA_DIR) {
+// Default dir = the ACTIVE league's dir (players caches pass SHARED_DIR explicitly).
+function loadJson(name, fallback, dir = (ST.ctx ? ST.ctx.dir : DATA_DIR)) {
   try {
     const p = path.join(dir, name);
     if (!fs.existsSync(p)) return fallback;
@@ -85,9 +86,10 @@ function loadJson(name, fallback, dir = DATA_DIR) {
 }
 
 const saveTimers = {};
-function saveJson(name, obj, dir = DATA_DIR) {          // debounced atomic write
-  clearTimeout(saveTimers[name]);
-  saveTimers[name] = setTimeout(() => {
+function saveJson(name, obj, dir = (ST.ctx ? ST.ctx.dir : DATA_DIR)) {          // debounced atomic write
+  const key = dir + '|' + name;                       // dir captured NOW (the active league may change before the timer fires)
+  clearTimeout(saveTimers[key]);
+  saveTimers[key] = setTimeout(() => {
     try {
       const p = path.join(dir, name);
       fs.writeFileSync(p + '.tmp', JSON.stringify(obj));
@@ -96,52 +98,178 @@ function saveJson(name, obj, dir = DATA_DIR) {          // debounced atomic writ
   }, 250);
 }
 
-// Global state. Everything the UI needs lives here and survives restarts via data/.
+// ------------------------------------------------ 2b. leagues (multi-league state)
+//
+// One server holds MANY leagues at once. Everything league-specific (session,
+// draft, board, advisor state, season state, rankings, SSE viewers) lives in a
+// league CONTEXT; `ST.<key>` is an accessor onto the ACTIVE context, so the
+// thousands of existing `ST.draft` / `ST.session` references work unchanged.
+// Rules that keep this safe (Node is single-threaded):
+//   - every request handler and every poll loop calls activate(ctx) at its top
+//     and again after EVERY await (another league may have run in between);
+//   - timer/promise callbacks capture their ctx and activate it first;
+//   - withCtx(ctx, fn) runs a SYNC fn against another league and restores.
+// Each league persists under its own dir: the original league keeps data/ so
+// existing installs upgrade in place; new ones live in data/leagues/<id>/.
+
+const CTX_KEYS = ['session', 'draft', 'board', 'poll', 'adv', 'season', 'sse', 'staticPrefix', 'rankings', 'rankingsMeta', 'prewarmedPrefix'];
 const ST = {
-  players: {},            // id -> {n, p, t, sr, inj, dpo}
+  players: {},            // id -> {n, p, t, sr, inj, dpo}   (shared by all leagues)
   nameIndex: null,        // built after players load
   playersFetchedAt: 0,    // for in-season staleness labeling + 4h refresh
-  rankings: [],           // resolved CSV rows
-  rankingsMeta: null,     // {name, importedAt, matchStats}
-  session: loadJson('session.json', { draft_id: null, my_slot: null, manual: {}, notes: {} }),
-  draft: { meta: null, picks: [], anomalies: [], status: null },
-  board: null,            // computed
-  poll: { failures: 0, degraded: false, lastOkAt: 0, timer: null, running: false },
-  adv: {                  // advisor engine state
-    seq: 0, inflight: null, latest: null, latency: [],
-    killLLM: false,       // debug: simulate Anthropic outage
-    season: { pending: {}, latest: {}, history: [] },   // kind -> {since, params} / kind -> rec / past advice lines
-  },
-  season: {               // in-season subsystem (parallel to draft; own poll loop)
-    league: null, users: [], rosters: [],
-    nfl: { week: null, season: null, season_type: null },
-    matchups: null, transactions: [],
-    proj: { week: null, byId: {}, fetchedAt: 0, degraded: true, count: 0 },
-    stats: { byWeek: {} },              // completed weeks -> {pid: pts}
-    liveStats: { week: null, byId: {}, fetchedAt: 0 },   // current week, refreshed fast during games
-    schedule: { byWeek: {}, fetchedAt: 0 },              // byWeek[w][TEAM] = {status, date, opp}
-    leagueSchedule: {},                 // league pairings: week -> [{roster_id, matchup_id}]
-    matchupHistory: {},                 // completed weeks -> matchups array (for recaps)
-    injSeen: {},                        // my players' last-seen injury status (alert diffing)
-    alerts: [],                         // [{pid, name, kind, from, to, at, week}]
-    odds: null,                         // cached playoff-odds sim {key, pct}
-    trending: { add: [], drop: [], fetchedAt: 0 },
-    rev: 0,                             // bumped on any data change; advice freshness token
-    sig: {},                            // change-detection signatures per dataset
-    poll: { failures: 0, degraded: false, lastOkAt: 0, timer: null, running: false, tick: 0 },
-    view: null,                         // computeSeason() output
-  },
-  sse: new Set(),
-  staticPrefix: null,     // cached-prompt block (byte-stable)
+  ctx: null,              // the ACTIVE league context (see accessors below)
+  leagues: new Map(),     // id -> ctx
+  registry: null,         // {leagues: [{id, name, dir}], active}
 };
-// session.json v2: league identity rides alongside the draft fields.
-if (ST.session.league_id === undefined) ST.session.league_id = null;
-if (ST.session.my_roster_id === undefined) ST.session.my_roster_id = null;
-if (ST.session.my_user_id === undefined) ST.session.my_user_id = null;
-// session.json v3: draft source ('sleeper' | 'espn') + ESPN connection details.
-// ESPN cookies live ONLY here (data/ is gitignored) and in env; never broadcast.
-if (!ST.session.source) ST.session.source = 'sleeper';
-if (!ST.session.espn) ST.session.espn = { league_id: null, season: null, team_id: null, espn_s2: null, swid: null };
+for (const k of CTX_KEYS) Object.defineProperty(ST, k, { enumerable: true, get() { return ST.ctx[k]; }, set(v) { ST.ctx[k] = v; } });
+function activate(ctx) { ST.ctx = ctx; return ctx; }
+function withCtx(ctx, fn) { const prev = ST.ctx; ST.ctx = ctx; try { return fn(); } finally { ST.ctx = prev; } }
+
+function newCtx(id, dir, name) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const session = loadJson('session.json', { draft_id: null, my_slot: null, manual: {}, notes: {} }, dir);
+  // session.json v2: league identity rides alongside the draft fields.
+  if (session.league_id === undefined) session.league_id = null;
+  if (session.my_roster_id === undefined) session.my_roster_id = null;
+  if (session.my_user_id === undefined) session.my_user_id = null;
+  // session.json v3: draft source ('sleeper' | 'espn') + ESPN connection details.
+  // ESPN cookies live ONLY here (data/ is gitignored) and in env; never broadcast.
+  if (!session.source) session.source = 'sleeper';
+  if (!session.espn) session.espn = { league_id: null, season: null, team_id: null, espn_s2: null, swid: null };
+  if (!session.manual) session.manual = {};
+  if (!session.notes) session.notes = {};
+  return {
+    id, dir, name: name || null,
+    session,
+    rankings: [],           // resolved CSV rows
+    rankingsMeta: null,     // {name, importedAt, matchStats}
+    draft: { meta: null, picks: [], anomalies: [], status: null },
+    board: null,            // computed
+    poll: { failures: 0, degraded: false, lastOkAt: 0, timer: null, running: false },
+    adv: {                  // advisor engine state
+      seq: 0, inflight: null, latest: null, latency: [],
+      killLLM: false,       // debug: simulate Anthropic outage
+      season: { pending: {}, latest: {}, history: [] },   // kind -> {since, params} / kind -> rec / past advice lines
+    },
+    season: {               // in-season subsystem (parallel to draft; own poll loop)
+      league: null, users: [], rosters: [],
+      nfl: { week: null, season: null, season_type: null },
+      matchups: null, transactions: [],
+      proj: { week: null, byId: {}, fetchedAt: 0, degraded: true, count: 0 },
+      stats: { byWeek: {} },              // completed weeks -> {pid: pts}
+      liveStats: { week: null, byId: {}, fetchedAt: 0 },   // current week, refreshed fast during games
+      schedule: { byWeek: {}, fetchedAt: 0 },              // byWeek[w][TEAM] = {status, date, opp}
+      leagueSchedule: {},                 // league pairings: week -> [{roster_id, matchup_id}]
+      matchupHistory: {},                 // completed weeks -> matchups array (for recaps)
+      injSeen: {},                        // my players' last-seen injury status (alert diffing)
+      alerts: [],                         // [{pid, name, kind, from, to, at, week}]
+      odds: null,                         // cached playoff-odds sim {key, pct}
+      trending: { add: [], drop: [], fetchedAt: 0 },
+      rev: 0,                             // bumped on any data change; advice freshness token
+      sig: {},                            // change-detection signatures per dataset
+      poll: { failures: 0, degraded: false, lastOkAt: 0, timer: null, running: false, tick: 0 },
+      view: null,                         // computeSeason() output
+    },
+    sse: new Set(),         // SSE viewers of THIS league
+    staticPrefix: null,     // cached-prompt block (byte-stable)
+    prewarmedPrefix: null,
+  };
+}
+
+// Registry: data/leagues.json. The first/original league is 'main' and owns data/ itself.
+function loadRegistry() {
+  const reg = loadJson('leagues.json', null, DATA_DIR) || { leagues: [{ id: 'main', name: null, dir: '.' }], active: 'main' };
+  if (!reg.leagues.some(l => l.id === 'main')) reg.leagues.unshift({ id: 'main', name: null, dir: '.' });
+  ST.registry = reg;
+  for (const l of reg.leagues) {
+    if (ST.leagues.has(l.id)) continue;
+    ST.leagues.set(l.id, newCtx(l.id, path.resolve(DATA_DIR, l.dir), l.name));
+  }
+  if (!ST.leagues.has(reg.active)) reg.active = 'main';
+  activate(ST.leagues.get(reg.active));
+}
+function saveRegistry() {                 // rare + important: written synchronously, not debounced
+  ST.registry.leagues = [...ST.leagues.values()].map(c => ({ id: c.id, name: c.name, dir: path.relative(DATA_DIR, c.dir) || '.' }));
+  try {
+    const p = path.join(DATA_DIR, 'leagues.json');
+    fs.writeFileSync(p + '.tmp', JSON.stringify(ST.registry));
+    fs.renameSync(p + '.tmp', p);
+  } catch (e) { warn('save leagues.json failed:', e.message); }
+}
+function leagueName(ctx) {
+  if (ctx.name) return ctx.name;
+  const s = ctx.session || {};
+  if (ctx.season && ctx.season.league && ctx.season.league.name) return ctx.season.league.name;
+  if (ctx.draft && ctx.draft.meta && ctx.draft.meta.metadata && ctx.draft.meta.metadata.name) return ctx.draft.meta.metadata.name;
+  if (s.source === 'espn' && s.espn && s.espn.league_id) return `ESPN ${s.espn.league_id}`;
+  if (s.draft_id) return `Sleeper draft …${String(s.draft_id).slice(-6)}`;
+  if (s.league_id) return `Sleeper league …${String(s.league_id).slice(-6)}`;
+  return ctx.id === 'main' ? 'Main league' : 'New league';
+}
+function leagueView(ctx) {
+  return withCtx(ctx, () => ({
+    id: ctx.id, name: leagueName(ctx), custom: !!ctx.name,
+    source: ctx.session.source || 'sleeper',
+    draftStatus: ctx.draft.status, draftId: ctx.session.draft_id, mySlot: ctx.session.my_slot,
+    seasonLeague: ctx.season.league ? ctx.season.league.name : null, seasonConnected: !!ctx.session.league_id,
+    needAdvice: externalNeedAdvice(), seasonPending: Object.keys(ctx.adv.season.pending || {}),
+    picksUntilMine: ctx.board ? ctx.board.picksUntilMine : null, onClock: !!(ctx.board && ctx.board.onClock),
+    degraded: !!ctx.poll.degraded, viewers: ctx.sse.size,
+    active: ST.registry && ST.registry.active === ctx.id,
+  }));
+}
+function leaguesView() { return { leagues: [...ST.leagues.values()].map(leagueView), active: ST.registry.active }; }
+function createLeague(name) {
+  const id = 'l' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+  const ctx = newCtx(id, path.join(DATA_DIR, 'leagues', id), name || null);
+  ST.leagues.set(id, ctx);
+  saveRegistry();
+  return ctx;
+}
+function removeLeague(id) {
+  const ctx = ST.leagues.get(id);
+  if (!ctx || id === 'main') return false;
+  withCtx(ctx, () => {
+    clearTimeout(ctx.poll.timer); ctx.poll.running = false;
+    clearTimeout(ctx.season.poll.timer); ctx.season.poll.running = false;
+    if (ctx.adv.inflight) abortInflight('league-removed');
+    for (const res of ctx.sse) { sseWrite(res, 'league_removed', { id }); try { res.end(); } catch { /* gone */ } }
+  });
+  ST.leagues.delete(id);
+  if (ST.registry.active === id) ST.registry.active = 'main';
+  if (ST.ctx === ctx) activate(ST.leagues.get('main'));
+  saveRegistry();
+  // the league's files stay on disk (data/leagues/<id>/) — nothing is destroyed
+  return true;
+}
+// Boot one league: rankings + persisted advice + season state, then resume its pollers.
+function bootCtx(ctx) {
+  withCtx(ctx, () => {
+    loadRankingsFromDisk();
+    const savedAdvice = loadJson('season-advice.json', null);
+    if (savedAdvice && savedAdvice.latest) ST.adv.season.latest = savedAdvice.latest;
+    if (savedAdvice && Array.isArray(savedAdvice.history)) ST.adv.season.history = savedAdvice.history;
+    loadSeasonFromDisk();
+  });
+}
+function resumeCtx(ctx) {
+  withCtx(ctx, () => {
+    if (ST.session.draft_id || (ST.session.source === 'espn' && ST.session.espn && ST.session.espn.league_id)) {
+      log(`[${leagueName(ctx)}] resuming ${ST.session.source === 'espn' ? 'ESPN' : 'Sleeper'} draft ${ST.session.draft_id} (slot ${ST.session.my_slot})`);
+      startPolling();
+    }
+    if (ST.session.league_id && !SEASON_FIXTURE) {
+      log(`[${leagueName(ctx)}] resuming league ${ST.session.league_id} (roster ${ST.session.my_roster_id || '?'})`);
+      startSeasonPolling();
+    }
+  });
+}
+// Resolve which league an HTTP request is about: ?league=, x-league header, else the server default.
+function resolveCtx(url, req) {
+  const id = url.searchParams.get('league') || req.headers['x-league'] || ST.registry.active;
+  return ST.leagues.get(id) || ST.leagues.get(ST.registry.active) || ST.leagues.get('main');
+}
+loadRegistry();
 
 // What the UI/tools may see of the session (cookies stripped).
 function sessionView() {
@@ -692,11 +820,14 @@ function startPolling(restart = false) {
 }
 
 function scheduleNextPoll(delay) {
+  const ctx = ST.ctx;                                   // the loop belongs to this league
+  if (!ST.leagues.has(ctx.id)) { ctx.poll.running = false; return; }   // league removed while a fetch was in flight
   clearTimeout(ST.poll.timer);
-  ST.poll.timer = setTimeout(() => { pollOnce().catch(e => warn('pollOnce escaped:', e.message)); }, delay);
+  ST.poll.timer = setTimeout(() => { activate(ctx); pollOnce().catch(e => warn('pollOnce escaped:', e.message)); }, delay);
 }
 
 async function pollOnce() {
+  const ctx = ST.ctx;
   if (ST.session.source === 'espn') return pollEspnOnce();
   const id = ST.session.draft_id;
   if (!id) { ST.poll.running = false; return; }
@@ -706,11 +837,12 @@ async function pollOnce() {
     const needMeta = !ST.draft.meta || pollTick % 8 === 1 || ST.draft.status !== 'drafting';
     if (needMeta) {
       const meta = await fetchJson(`${SLEEPER_BASE}/draft/${id}`, {}, 10000);
+      activate(ctx);
       if (ST.session.draft_id !== id) return scheduleNextPoll(POLL_MS);  // draft switched mid-fetch
       const prevStatus = ST.draft.status;
       ST.draft.meta = meta; ST.draft.status = meta.status;
       if (prevStatus && prevStatus !== meta.status) {
-        log(`draft status: ${prevStatus} -> ${meta.status}`);
+        log(`draft status: ${prevStatus} -> ${meta.status}`); leaguesChanged();
         if (meta.status === 'complete') broadcast('toast', { kind: 'info', msg: 'Draft complete.' });
         if (prevStatus === 'pre_draft' && meta.status === 'drafting') broadcast('toast', { kind: 'info', msg: 'Draft is live!' });
         computeVorp(); rebuildStaticPrefix();
@@ -718,6 +850,7 @@ async function pollOnce() {
     }
     if (ST.draft.status !== 'pre_draft') {
       const picks = await fetchJson(`${SLEEPER_BASE}/draft/${id}/picks`, {}, 10000);
+      activate(ctx);
       if (ST.session.draft_id !== id) return scheduleNextPoll(POLL_MS);  // draft switched mid-fetch
       const changed = picks.length !== ST.draft.picks.length;
       ST.draft.picks = picks;
@@ -734,6 +867,7 @@ async function pollOnce() {
     ST.poll.failures = 0; ST.poll.degraded = false; ST.poll.lastOkAt = Date.now();
     if (ST.draft.status === 'complete') delay = 30000;   // draft over: idle slowly
   } catch (e) {
+    activate(ctx);
     ST.poll.failures++;
     ST.poll.degraded = ST.poll.failures >= 2;
     delay = Math.min(15000, 1000 * 2 ** Math.min(ST.poll.failures - 1, 4));   // 1,2,4,8,15s
@@ -770,8 +904,12 @@ const ESPN_LINEUP_SLOT = { 0: 'slots_qb', 1: 'slots_qb', 2: 'slots_rb', 3: 'slot
 
 function espnCookies() {
   const e = ST.session.espn || {};
-  const s2 = e.espn_s2 || process.env.ESPN_S2 || '';
-  const swid = e.swid || process.env.ESPN_SWID || '';
+  let s2 = e.espn_s2 || process.env.ESPN_S2 || '';
+  let swid = e.swid || process.env.ESPN_SWID || '';
+  if (!s2 || !swid) {
+    // same ESPN account across leagues: borrow another league's cookies
+    for (const c of ST.leagues.values()) { const o = c.session.espn || {}; if (o.espn_s2 && o.swid) { s2 = o.espn_s2; swid = o.swid; break; } }
+  }
   if (!s2 || !swid) return null;
   return `espn_s2=${s2}; SWID=${swid}`;
 }
@@ -831,11 +969,11 @@ async function loadEspnPlayers(season) {
   return espnPlayers.loading;
 }
 // Look up specific ESPN player ids via the league's kona_player_info view.
-async function espnLookupIds(leagueId, season, ids) {
+async function espnLookupIds(leagueId, season, ids, headers = espnHeaders()) {
   if (!ids.length) return;
   const url = `${ESPN_BASE}/seasons/${season}/segments/0/leagues/${leagueId}?view=kona_player_info`;
   const filter = { players: { filterIds: { value: ids.slice(0, 50) }, limit: 50 } };
-  const j = await fetchJson(url, { headers: espnHeaders({ 'x-fantasy-filter': JSON.stringify(filter) }) }, 12000);
+  const j = await fetchJson(url, { headers: { ...headers, 'x-fantasy-filter': JSON.stringify(filter) } }, 12000);
   let n = 0;
   for (const e of (j && j.players) || []) { const row = espnPlayerRow(e.player || e); if (row) { espnPlayers.byId[e.id != null ? e.id : e.player.id] = row; n++; } }
   if (n) saveJson(`espn-players-${ESPN_BASE.includes('espn.com') ? '' : 'mock-'}${season}.json`, { fetchedAt: espnPlayers.fetchedAt || Date.now(), byId: espnPlayers.byId }, SHARED_DIR);
@@ -907,19 +1045,22 @@ function espnToDraft(raw, opts = {}) {
 }
 
 async function pollEspnOnce() {
+  const ctx = ST.ctx;
   const e = ST.session.espn || {};
   const key = `${e.league_id}|${e.season}`;
   if (!e.league_id) { ST.poll.running = false; return; }
   let delay = ESPN_POLL_MS;
   try {
     pollTick++;
+    const headers = espnHeaders();                       // cookies read while this league is active
     await loadEspnPlayers(e.season);
-    const raw = await fetchEspnLeague(e.league_id, e.season);
+    const raw = await fetchJson(espnLeagueUrl(e.league_id, e.season), { headers }, 12000);
+    activate(ctx);
     if (`${(ST.session.espn || {}).league_id}|${(ST.session.espn || {}).season}` !== key) return scheduleNextPoll(ESPN_POLL_MS);   // switched mid-fetch
     let conv = espnToDraft(raw, { teamId: e.team_id });
     if (conv.unknownIds.length) {
-      try { await espnLookupIds(e.league_id, e.season, conv.unknownIds); conv = espnToDraft(raw, { teamId: e.team_id }); }
-      catch (err) { warn(`espn id lookup failed (${conv.unknownIds.length} unknown): ${err.message}`); }
+      try { await espnLookupIds(e.league_id, e.season, conv.unknownIds, headers); activate(ctx); conv = espnToDraft(raw, { teamId: e.team_id }); }
+      catch (err) { activate(ctx); warn(`espn id lookup failed (${conv.unknownIds.length} unknown): ${err.message}`); }
     }
     const prevStatus = ST.draft.status;
     const first = !ST.draft.meta;
@@ -930,7 +1071,7 @@ async function pollEspnOnce() {
       broadcast('session', sessionView());
     }
     if (prevStatus && prevStatus !== conv.meta.status) {
-      log(`draft status: ${prevStatus} -> ${conv.meta.status}`);
+      log(`draft status: ${prevStatus} -> ${conv.meta.status}`); leaguesChanged();
       if (conv.meta.status === 'complete') broadcast('toast', { kind: 'info', msg: 'Draft complete.' });
       if (prevStatus === 'pre_draft' && conv.meta.status === 'drafting') broadcast('toast', { kind: 'info', msg: 'Draft is live!' });
       computeVorp(); rebuildStaticPrefix();
@@ -945,6 +1086,7 @@ async function pollEspnOnce() {
     if (ST.draft.status === 'complete') delay = 30000;
     else if (ST.draft.status === 'pre_draft') delay = Math.max(ESPN_POLL_MS, 5000);
   } catch (err) {
+    activate(ctx);
     ST.poll.failures++;
     ST.poll.degraded = ST.poll.failures >= 2;
     delay = Math.min(15000, 1000 * 2 ** Math.min(ST.poll.failures - 1, 4));
@@ -1120,8 +1262,10 @@ function startAdvice(board) {
   }, Number(process.env.ADVICE_TIMEOUT_MS || 150000));
   const clearTimers = () => { clearTimeout(firstEventTimer); clearTimeout(totalTimer); };
 
+  const ctx = ST.ctx;
   const run = MOCK_LLM ? mockAdvise(board, controller.signal, handlers) : callAnthropic(board, controller.signal, handlers);
   run.then((result) => {
+    activate(ctx);
     clearTimers();
     if (inf.aborted) return;
     ST.adv.inflight = null;
@@ -1145,6 +1289,7 @@ function startAdvice(board) {
     // still in the window (or on the clock), the normal rules fire a fresh one.
     if (inf.refreshAfter && !ST.adv.inflight) advisorOnBoardChange();
   }).catch((e) => {
+    activate(ctx);
     clearTimers();
     if (inf.aborted) return;               // deliberate aborts are expected, not errors
     ST.adv.inflight = null;
@@ -1158,7 +1303,7 @@ function startAdvice(board) {
     const b = ST.board;
     if (b && b.onClock && b.pickCount === inf.basedOn && !ST.adv.retryPending) {
       ST.adv.retryPending = true;
-      setTimeout(() => { ST.adv.retryPending = false; const bb = ST.board; if (bb && bb.onClock && !ST.adv.inflight && !(ST.adv.latest && ST.adv.latest.basedOn === bb.pickCount)) startAdvice(bb); }, 2500);
+      setTimeout(() => { activate(ctx); ST.adv.retryPending = false; const bb = ST.board; if (bb && bb.onClock && !ST.adv.inflight && !(ST.adv.latest && ST.adv.latest.basedOn === bb.pickCount)) startAdvice(bb); }, 2500);
     }
   });
 }
@@ -1254,11 +1399,10 @@ function buildDynamicMessage(board) {
 // Write the prompt-cache entry before the draft heats up so the first real
 // advice call reads the cache instead of writing it. max_tokens: 0 is the
 // documented pre-warm shape (no output billed). Failures are non-fatal.
-let prewarmedPrefix = null;
 async function prewarmCache() {
   if (MOCK_LLM || !process.env.ANTHROPIC_API_KEY) return;
-  if (!ST.staticPrefix || ST.staticPrefix === prewarmedPrefix) return;
-  prewarmedPrefix = ST.staticPrefix;
+  if (!ST.staticPrefix || ST.staticPrefix === ST.prewarmedPrefix) return;
+  ST.prewarmedPrefix = ST.staticPrefix;
   try {
     const r = await fetch(ANTHROPIC_URL, {
       method: 'POST',
@@ -1281,6 +1425,7 @@ async function prewarmCache() {
 }
 
 async function callAnthropic(board, signal, h) {
+  const ctx = ST.ctx;
   if (ST.adv.killLLM) throw new Error('simulated API outage (debug kill switch)');
   if (!ST.staticPrefix) rebuildStaticPrefix();
   const body = {
@@ -1312,7 +1457,7 @@ async function callAnthropic(board, signal, h) {
   const decoder = new TextDecoder();
   let buf = '';
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await reader.read(); activate(ctx);
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     let idx;
@@ -1354,7 +1499,8 @@ async function mockAdvise(board, signal, h) {
     signal.addEventListener('abort', () => { clearTimeout(t); rej(new Error('aborted')); }, { once: true });
   });
   h.onEvent({ type: 'message_start' });
-  await sleep(MOCK_THINK_MS * (0.5 + Math.random()));
+  const ctx = ST.ctx;
+  await sleep(MOCK_THINK_MS * (0.5 + Math.random())); activate(ctx);
   const cands = board.candidates.length ? board.candidates : board.fallback;
   const scored = cands.map(c => ({ c, s: (200 - c.rank) + (c.vorp || 0) * 0.5 + (c.survival && c.survival.adj < 40 ? 25 : 0) + ((board.myNeeds && board.myNeeds.dedicated[c.pos] > 0) ? 15 : 0) - ((c.pos === 'K' || c.pos === 'DEF') && board.phase !== 'late' ? 500 : 0) }));
   scored.sort((a, b) => b.s - a.s);
@@ -1371,7 +1517,7 @@ async function mockAdvise(board, signal, h) {
   };
   const full = `PICK: ${top.name} (${top.pos}, ${top.team})\n\`\`\`json\n${JSON.stringify(payload, null, 1)}\n\`\`\`\n`;
   for (let i = 0; i < full.length; i += 12) {
-    await sleep(25);
+    await sleep(25); activate(ctx);
     h.onText(full.slice(i, i + 12));
   }
   return { stopReason: 'end_turn' };
@@ -1443,12 +1589,16 @@ function startSeasonPolling() {
 }
 
 function scheduleNextSeasonPoll(delay) {
+  const ctx = ST.ctx;
+  if (!ST.leagues.has(ctx.id)) { ctx.season.poll.running = false; return; }   // league removed mid-fetch
   clearTimeout(ST.season.poll.timer);
-  ST.season.poll.timer = setTimeout(() => { seasonPollOnce().catch(e => warn('seasonPollOnce escaped:', e.message)); }, delay);
+  ST.season.poll.timer = setTimeout(() => { activate(ctx); seasonPollOnce().catch(e => warn('seasonPollOnce escaped:', e.message)); }, delay);
   ST.season.poll.timer.unref && ST.season.poll.timer.unref();
 }
 
 async function seasonPollOnce(force) {
+  const ctx = ST.ctx;
+  const A = (v) => { activate(ctx); return v; };        // re-activate this league after every await
   const lid = ST.session.league_id;
   const se = ST.season;
   if (!lid) { se.poll.running = false; return; }
@@ -1466,7 +1616,7 @@ async function seasonPollOnce(force) {
     const mid = force || t === 1 || t % 5 === 0;     // ~5 min
 
     if (slow) {
-      const st = await fetchJson(`${SLEEPER_REAL}/state/nfl`, {}, 10000);
+      const st = A(await fetchJson(`${SLEEPER_REAL}/state/nfl`, {}, 10000));
       const week = Math.max(1, Number(st.leg || st.week) || 1);
       const prevWeek = se.nfl.week;
       se.nfl = { week, season: String(st.season), season_type: st.season_type };
@@ -1480,17 +1630,17 @@ async function seasonPollOnce(force) {
         broadcast('toast', { kind: 'info', msg: `Week ${week} — matchups and projections refreshing.` });
         advChanged = true;
       }
-      se.league = await fetchJson(`${SLEEPER_REAL}/league/${lid}`, {}, 10000);
+      se.league = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}`, {}, 10000));
       mark('league', { s: se.league.settings, n: se.league.name });
-      se.users = await fetchJson(`${SLEEPER_REAL}/league/${lid}/users`, {}, 10000);
+      se.users = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/users`, {}, 10000));
       mark('users', se.users.map(u => u.user_id + '|' + u.display_name));
-      if (await maybeRefreshPlayers()) { changed = true; advChanged = true; }
+      if (A(await maybeRefreshPlayers())) { changed = true; advChanged = true; }
       // league future pairings for the playoff-odds sim (fetch each remaining week once per week)
       try {
         const lastReg = (se.league.settings && se.league.settings.playoff_week_start || 15) - 1;
         for (let w = week + 1; w <= lastReg; w++) {
           if (se.leagueSchedule[w]) continue;
-          const mus = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${w}`, {}, 10000);
+          const mus = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${w}`, {}, 10000));
           se.leagueSchedule[w] = (mus || []).map(m => ({ roster_id: m.roster_id, matchup_id: m.matchup_id }));
         }
       } catch (e) { warn('league schedule fetch failed (non-fatal):', e.message); }
@@ -1501,7 +1651,7 @@ async function seasonPollOnce(force) {
     // NFL schedule (game statuses drive the live scoreboard + lock badges).
     // Fetched on the mid tier normally, every tick while any game is live.
     const fetchSchedule = async () => {
-      const rows = await fetchJson(`${SLEEPER_STATS}/schedule/nfl/regular/${se.nfl.season}`, {}, 15000);
+      const rows = A(await fetchJson(`${SLEEPER_STATS}/schedule/nfl/regular/${se.nfl.season}`, {}, 15000));
       const byWeek = {};
       for (const g of rows || []) {
         if (!g || !g.week || !g.home || !g.away) continue;
@@ -1514,13 +1664,13 @@ async function seasonPollOnce(force) {
     const liveNow = Object.values((se.schedule.byWeek || {})[wk] || {})
       .some(g => g.status && g.status !== 'pre_game' && g.status !== 'complete');
     if (mid || liveNow || !se.schedule.fetchedAt) {
-      try { await fetchSchedule(); } catch (e) { warn('schedule fetch failed (non-fatal):', e.message); }
+      try { A(await fetchSchedule()); } catch (e) { activate(ctx); warn('schedule fetch failed (non-fatal):', e.message); }
     }
     // current-week live stats: every tick during games, mid tier otherwise
     if (mid || liveNow) {
       try {
         const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
-        const rows = await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000);
+        const rows = A(await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000));
         const { byId } = parseStatRows(rows, se.league && se.league.scoring_settings);
         const pts = {}; for (const [pid, r] of Object.entries(byId)) if (r.pts != null) pts[pid] = r.pts;
         se.liveStats = { week: wk, byId: pts, fetchedAt: Date.now() };
@@ -1530,16 +1680,16 @@ async function seasonPollOnce(force) {
 
     if (mid) {
       try {
-        const [add, drop] = await Promise.all([
+        const [add, drop] = A(await Promise.all([
           fetchJson(`${SLEEPER_REAL}/players/nfl/trending/add?lookback_hours=24&limit=75`, {}, 10000),
           fetchJson(`${SLEEPER_REAL}/players/nfl/trending/drop?lookback_hours=24&limit=75`, {}, 10000),
-        ]);
+        ]));
         se.trending = { add, drop, fetchedAt: Date.now() };
         mark('trending', add.slice(0, 25).map(x => x.player_id));   // ids only; counts churn constantly
       } catch (e) { warn('trending fetch failed (non-fatal):', e.message); }
       try {
         const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
-        const rows = await fetchJson(`${SLEEPER_STATS}/projections/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000);
+        const rows = A(await fetchJson(`${SLEEPER_STATS}/projections/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000));
         const { byId, count } = parseStatRows(rows, se.league && se.league.scoring_settings);
         se.proj = { week: wk, byId, fetchedAt: Date.now(), degraded: count < 50, count };
         mark('proj', { week: wk, count });
@@ -1550,7 +1700,7 @@ async function seasonPollOnce(force) {
       if (missingWeek) {
         try {
           const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
-          const rows = await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${missingWeek}?season_type=regular&${pos}`, {}, 20000);
+          const rows = A(await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${missingWeek}?season_type=regular&${pos}`, {}, 20000));
           const { byId } = parseStatRows(rows, se.league && se.league.scoring_settings);
           const pts = {}; for (const [pid, r] of Object.entries(byId)) if (r.pts != null) pts[pid] = r.pts;
           se.stats.byWeek[missingWeek] = pts;
@@ -1563,7 +1713,7 @@ async function seasonPollOnce(force) {
       for (let w = 1; w < wk; w++) if (!se.matchupHistory[w]) { missingMu = w; break; }
       if (missingMu) {
         try {
-          se.matchupHistory[missingMu] = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${missingMu}`, {}, 10000);
+          se.matchupHistory[missingMu] = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${missingMu}`, {}, 10000));
           changed = true;
           log(`week ${missingMu} matchup results archived`);
         } catch (e) { warn('matchup history fetch failed (non-fatal):', e.message); }
@@ -1571,17 +1721,17 @@ async function seasonPollOnce(force) {
     }
 
     // every tick: rosters, matchups, transactions
-    const rosters = await fetchJson(`${SLEEPER_REAL}/league/${lid}/rosters`, {}, 10000);
+    const rosters = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/rosters`, {}, 10000));
     if (ST.session.league_id !== lid) return scheduleNextSeasonPoll(SEASON_POLL_MS);  // league switched mid-fetch
     se.rosters = rosters;
     if (mark('rosters', rosters.map(r => [r.roster_id, r.players, r.starters, r.settings && r.settings.wins]))) advChanged = true;
     try {
-      const mus = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${wk}`, {}, 10000);
+      const mus = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${wk}`, {}, 10000));
       se.matchups = mus;
       mark('matchups', (mus || []).map(m => [m.roster_id, m.matchup_id, m.points]));
     } catch (e) { warn('matchups fetch failed (non-fatal):', e.message); }
     try {
-      const txs = await fetchJson(`${SLEEPER_REAL}/league/${lid}/transactions/${wk}`, {}, 10000);
+      const txs = A(await fetchJson(`${SLEEPER_REAL}/league/${lid}/transactions/${wk}`, {}, 10000));
       se.transactions = txs || [];
       mark('transactions', (txs || []).map(x => x.transaction_id + '|' + x.status));
     } catch (e) { warn('transactions fetch failed (non-fatal):', e.message); }
@@ -1598,6 +1748,7 @@ async function seasonPollOnce(force) {
       saveSeason();
     }
   } catch (e) {
+    activate(ctx);
     se.poll.failures++;
     se.poll.degraded = se.poll.failures >= 2;
     delay = Math.min(300000, SEASON_POLL_MS * 2 ** Math.min(se.poll.failures - 1, 3));
@@ -2575,16 +2726,22 @@ function sseWrite(res, event, data) {
   try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch { /* client gone */ }
 }
 
-function broadcast(event, data) {
+function broadcast(event, data) {           // to the ACTIVE league's viewers
   for (const res of ST.sse) sseWrite(res, event, data);
 }
+function broadcastAll(event, data) {        // to every viewer of every league
+  for (const c of ST.leagues.values()) for (const res of c.sse) sseWrite(res, event, data);
+}
+function leaguesChanged() { broadcastAll('leagues', leaguesView()); }
 
-setInterval(() => broadcast('ping', { t: Date.now() }), 15000).unref();
+setInterval(() => { broadcastAll('ping', { t: Date.now() }); leaguesChanged(); }, 15000).unref();
 
 function snapshot() {
   const seasonAdvice = {};
   for (const [kind, rec] of Object.entries(ST.adv.season.latest)) seasonAdvice[kind] = seasonAdviceEvent(rec);
   return {
+    league: leagueView(ST.ctx),
+    leagues: leaguesView(),
     board: ST.board,
     session: sessionView(),
     rankingsMeta: ST.rankingsMeta,
@@ -2633,6 +2790,42 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const p = url.pathname;
+    const ctx = resolveCtx(url, req);      // which league this request is about
+    activate(ctx);                         // (re-activated again after every await below)
+
+    // ---- league registry ----
+    if (p === '/api/leagues' && req.method === 'GET') return json(res, 200, leaguesView());
+    if (p === '/api/leagues' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req)); activate(ctx);
+      const c = createLeague(String(body.name || '').trim().slice(0, 60) || null);
+      log(`league created: ${c.id}${c.name ? ` "${c.name}"` : ''}`);
+      leaguesChanged();
+      return json(res, 200, { ok: true, league: leagueView(c) });
+    }
+    if (p === '/api/leagues/rename' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req)); activate(ctx);
+      const c = ST.leagues.get(String(body.id || ctx.id));
+      if (!c) return json(res, 404, { error: 'no such league' });
+      c.name = String(body.name || '').trim().slice(0, 60) || null;
+      saveRegistry(); leaguesChanged();
+      return json(res, 200, { ok: true, league: leagueView(c) });
+    }
+    if (p === '/api/leagues/active' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req)); activate(ctx);
+      const id = String(body.id || ctx.id);
+      if (!ST.leagues.has(id)) return json(res, 404, { error: 'no such league' });
+      ST.registry.active = id; saveRegistry(); leaguesChanged();
+      return json(res, 200, { ok: true, active: id });
+    }
+    if (p === '/api/leagues/remove' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req)); activate(ctx);
+      const id = String(body.id || '');
+      if (id === 'main') return json(res, 400, { error: 'the main league cannot be removed (reset it instead)' });
+      if (!removeLeague(id)) return json(res, 404, { error: 'no such league' });
+      log(`league removed: ${id}`);
+      leaguesChanged();
+      return json(res, 200, { ok: true });
+    }
 
     if (p === '/' || p === '/index.html') {
       const html = fs.readFileSync(path.join(__dirname, 'public', 'index.html'));
@@ -2644,11 +2837,11 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/events') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
       res.write('retry: 1500\n\n');
-      ST.sse.add(res);
+      ctx.sse.add(res);
       sseWrite(res, 'snapshot', snapshot());
-      req.on('close', () => ST.sse.delete(res));
-      req.on('error', () => ST.sse.delete(res));
-      res.on('error', () => ST.sse.delete(res));
+      req.on('close', () => ctx.sse.delete(res));
+      req.on('error', () => ctx.sse.delete(res));
+      res.on('error', () => ctx.sse.delete(res));
       return;
     }
 
@@ -2663,7 +2856,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/rankings' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       const meta = importRankings(body.csvText, body.name);
       computeBoard();
       broadcast('rankings', { meta, rankings: ST.rankings });
@@ -2673,7 +2866,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/draft' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       if (body.source === 'espn') {
         const leagueId = String(body.league_id || '').trim();
         if (!/^\d{3,25}$/.test(leagueId)) return json(res, 400, { error: 'league_id must be the numeric ESPN league id (from the league URL: leagueId=…)' });
@@ -2685,17 +2878,19 @@ const server = http.createServer(async (req, res) => {
         if (swid && !swid.startsWith('{')) swid = `{${swid.replace(/[{}]/g, '')}}`;
         ST.session.espn = { ...prevEspn, espn_s2: s2, swid };
         let raw;
+        const headers = espnHeaders();
         try {
-          await loadEspnPlayers(season);
-          raw = await fetchEspnLeague(leagueId, season);
+          await loadEspnPlayers(season); activate(ctx);
+          raw = await fetchJson(espnLeagueUrl(leagueId, season), { headers }, 12000); activate(ctx);
         } catch (e) {
+          activate(ctx);
           ST.session.espn = prevEspn;
           const hint = e.status === 401 || e.status === 403 ? ' — private league? paste espn_s2 + SWID cookies' : (e.status === 404 ? ' — check league id / season' : '');
           return json(res, 502, { error: `could not fetch ESPN league: ${e.message}${hint}` });
         }
         const teamId = body.team_id != null && body.team_id !== '' ? Number(body.team_id) : null;
         let conv = espnToDraft(raw, { teamId });
-        if (conv.unknownIds.length) { try { await espnLookupIds(leagueId, season, conv.unknownIds); conv = espnToDraft(raw, { teamId }); } catch (e) { warn('espn id lookup failed:', e.message); } }
+        if (conv.unknownIds.length) { try { await espnLookupIds(leagueId, season, conv.unknownIds, headers); activate(ctx); conv = espnToDraft(raw, { teamId }); } catch (e) { activate(ctx); warn('espn id lookup failed:', e.message); } }
         // validated: commit
         ST.session.source = 'espn';
         ST.session.draft_id = `espn:${leagueId}`;
@@ -2710,7 +2905,7 @@ const server = http.createServer(async (req, res) => {
         broadcast('board', ST.board);
         broadcast('status', pollStatus());
         broadcast('session', sessionView());
-        return json(res, 200, {
+        leaguesChanged(); return json(res, 200, {
           ok: true, source: 'espn', status: ST.draft.status, league_name: conv.meta.metadata.name, order_set: conv.meta.order_set,
           meta: { teams: conv.meta.settings.teams, rounds: conv.meta.settings.rounds, type: conv.meta.type, scoring: conv.meta.metadata.scoring_type },
           teams: conv.teams, my_slot: ST.session.my_slot, picks: conv.picks.length, unknown: conv.unknownIds.length,
@@ -2720,8 +2915,8 @@ const server = http.createServer(async (req, res) => {
       if (!/^\d{5,25}$/.test(draftId)) return json(res, 400, { error: 'draft_id must be the numeric Sleeper draft id' });
       let meta;
       try {
-        meta = await fetchJson(`${SLEEPER_BASE}/draft/${draftId}`, {}, 10000);
-      } catch (e) { return json(res, 502, { error: `could not fetch draft: ${e.message}` }); }
+        meta = await fetchJson(`${SLEEPER_BASE}/draft/${draftId}`, {}, 10000); activate(ctx);
+      } catch (e) { activate(ctx); return json(res, 502, { error: `could not fetch draft: ${e.message}` }); }
       // validated: now commit the session change
       ST.session.source = 'sleeper';
       ST.session.draft_id = draftId;
@@ -2734,11 +2929,11 @@ const server = http.createServer(async (req, res) => {
       startPolling(true);
       broadcast('board', ST.board);
       broadcast('status', pollStatus());
-      return json(res, 200, { ok: true, status: ST.draft.status, meta: { teams: ST.draft.meta.settings.teams, rounds: ST.draft.meta.settings.rounds, type: ST.draft.meta.type } });
+      leaguesChanged(); return json(res, 200, { ok: true, status: ST.draft.status, meta: { teams: ST.draft.meta.settings.teams, rounds: ST.draft.meta.settings.rounds, type: ST.draft.meta.type } });
     }
 
     if (p === '/api/slot' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       ST.session.my_slot = Number(body.my_slot) || null;
       if (ST.session.source === 'espn') {
         // ESPN: the slot select carries team ids when the order isn't set yet; keep team_id in sync either way
@@ -2756,7 +2951,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/mark' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       if (!body.player_id) return json(res, 400, { error: 'player_id required' });
       if (body.drafted) ST.session.manual[body.player_id] = true;
       else delete ST.session.manual[body.player_id];
@@ -2767,7 +2962,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/note' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       if (!body.player_id) return json(res, 400, { error: 'player_id required' });
       if (body.note) ST.session.notes[body.player_id] = String(body.note).slice(0, 300);
       else delete ST.session.notes[body.player_id];
@@ -2837,7 +3032,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/advisor/submit' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       const text = String(body.text || '');
       if (!text.trim()) return json(res, 400, { error: 'text required' });
       // season kinds take their own path; absent/draft kind falls through to the draft path unchanged
@@ -2907,7 +3102,7 @@ const server = http.createServer(async (req, res) => {
 
     // ---- season routes ----
     if (p === '/api/league' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       const leagueId = String(body.league_id || '').trim();
       if (!/^\d{5,25}$/.test(leagueId)) return json(res, 400, { error: 'league_id must be the numeric Sleeper league id' });
       let league, users, rosters;
@@ -2916,8 +3111,8 @@ const server = http.createServer(async (req, res) => {
           fetchJson(`${SLEEPER_REAL}/league/${leagueId}`, {}, 10000),
           fetchJson(`${SLEEPER_REAL}/league/${leagueId}/users`, {}, 10000),
           fetchJson(`${SLEEPER_REAL}/league/${leagueId}/rosters`, {}, 10000),
-        ]);
-      } catch (e) { return json(res, 502, { error: `could not fetch league: ${e.message}` }); }
+        ]); activate(ctx);
+      } catch (e) { activate(ctx); return json(res, 502, { error: `could not fetch league: ${e.message}` }); }
       // validated: commit
       ST.session.league_id = leagueId;
       saveJson('session.json', ST.session);
@@ -2938,11 +3133,11 @@ const server = http.createServer(async (req, res) => {
       computeSeason();
       startSeasonPolling();
       broadcast('season', se.view);
-      return json(res, 200, { ok: true, name: league.name, teams, guess, week: se.nfl.week });
+      leaguesChanged(); return json(res, 200, { ok: true, name: league.name, teams, guess, week: se.nfl.week });
     }
 
     if (p === '/api/league/me' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       const rid = Number(body.roster_id) || null;
       ST.session.my_roster_id = rid;
       const r = rid ? ST.season.rosters.find(x => x.roster_id === rid) : null;
@@ -2975,7 +3170,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/season/ask' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       const kind = String(body.kind || '');
       if (!SEASON_KINDS.has(kind)) return json(res, 400, { error: `kind must be one of: ${[...SEASON_KINDS].join(', ')}` });
       if (!ST.season.view) return json(res, 400, { error: 'no league connected' });
@@ -2999,7 +3194,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/season/trade/eval' && req.method === 'POST') {
-      const body = JSON.parse(await readBody(req));
+      const body = JSON.parse(await readBody(req)); activate(ctx);
       if (!ST.season.view) return json(res, 400, { error: 'no league connected' });
       const ev = computeTradeEval(body || {});
       if (ev.error) return json(res, 400, { error: ev.error });
@@ -3009,7 +3204,7 @@ const server = http.createServer(async (req, res) => {
     // debug endpoints — replay/test mode only
     if (p.startsWith('/api/debug/') && (REPLAY || MOCK_LLM || SEASON_FIXTURE)) {
       if (p === '/api/debug/kill-llm' && req.method === 'POST') {
-        const body = JSON.parse(await readBody(req));
+        const body = JSON.parse(await readBody(req)); activate(ctx);
         ST.adv.killLLM = !!body.on;
         if (ST.adv.killLLM && ST.adv.inflight) abortInflight('killed');
         log(`debug: LLM kill switch ${ST.adv.killLLM ? 'ON' : 'OFF'}`);
@@ -3040,6 +3235,7 @@ module.exports = {
   normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST,
   resolvePlayer, buildNameIndex, COL_PATTERNS, externalNeedAdvice, parseAdviceJson, ADVISOR,
   espnToDraft, espnLeagueUrl, espnHeaders, espnSeasonDefault, fetchEspnLeague, loadEspnPlayers, espnLookupIds, espnPlayers, sessionView, fetchJson, loadPlayers,
+  activate, withCtx, newCtx, createLeague, removeLeague, leagueName, leagueView, leaguesView,
   // season pure math (selftest + tools)
   optimalLineup, projPoints, parseStatRows, buildValueIndex, lineupInfo, computeLineup,
   computeWaivers, computeNeedProfile, computeTradeEval, computeTradeScan, computeSeason,
@@ -3053,22 +3249,12 @@ process.on('unhandledRejection', (e) => { warn('unhandledRejection:', e && (e.st
 
 (async () => {
   await loadPlayers();
-  loadRankingsFromDisk();
-  const savedAdvice = loadJson('season-advice.json', null);
-  if (savedAdvice && savedAdvice.latest) ST.adv.season.latest = savedAdvice.latest;
-  if (savedAdvice && Array.isArray(savedAdvice.history)) ST.adv.season.history = savedAdvice.history;
-  loadSeasonFromDisk();
+  for (const c of ST.leagues.values()) bootCtx(c);
+  log(`leagues: ${[...ST.leagues.values()].map(c => `${c.id}=${JSON.stringify(leagueName(c))}`).join(', ')} (default: ${ST.registry.active})`);
   server.listen(PORT, () => {
     log(`Draft War Room${PROFILE ? ` [profile: ${PROFILE}]` : ''} on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''}${SEASON_FIXTURE ? ' [SEASON_FIXTURE]' : ''} effort=${EFFORT}`);
     if (ADVISOR === 'external') log('EXTERNAL ADVISOR mode — advice comes from a Claude session (tools/advisor-watch.js wakes it; POST /api/advisor/submit delivers; 📋 in the UI copies the prompt for manual paste)');
     else if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) warn('ANTHROPIC_API_KEY is not set — advisor disabled, fallback board only');
-    if (ST.session.draft_id || (ST.session.source === 'espn' && ST.session.espn && ST.session.espn.league_id)) {
-      log(`resuming ${ST.session.source === 'espn' ? 'ESPN' : 'Sleeper'} draft ${ST.session.draft_id} (slot ${ST.session.my_slot}) from session.json`);
-      startPolling();
-    }
-    if (ST.session.league_id && !SEASON_FIXTURE) {
-      log(`resuming league ${ST.session.league_id} (roster ${ST.session.my_roster_id || '?'}) from session.json`);
-      startSeasonPolling();
-    }
+    for (const c of ST.leagues.values()) resumeCtx(c);
   });
 })();

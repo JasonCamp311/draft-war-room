@@ -12,6 +12,20 @@ single-file UI:
   ("Ask Claude" per tab → `POST /api/season/ask`), delivered by the external
   advisor (a Claude Code session running `tools/advisor-watch.js --season`).
 
+**Multi-league (2026-09-06):** one server holds many leagues. Everything
+league-specific lives in a league CONTEXT (`newCtx()`, section 2b); `ST.session`,
+`ST.draft`, `ST.board`, `ST.adv`, `ST.season`, `ST.rankings`, `ST.sse`, … are
+accessors onto the ACTIVE context, so the whole codebase reads as single-league.
+Invariants: every request handler / poll loop calls `activate(ctx)` at its top
+AND after every `await` (see the `A(await …)` helper in `seasonPollOnce`);
+timer/promise callbacks capture their ctx and activate it; `withCtx(ctx, fn)` for
+sync work on another league. Requests pick their league via `?league=` or the
+`x-league` header (default = registry `active`). `broadcast()` = viewers of the
+active league; `broadcastAll()` = everyone (league list). Registry
+`data/leagues.json`; the original league is `main` and owns `data/` itself,
+others live in `data/leagues/<id>/`. Watcher scans all leagues unless `--league`.
+Verify with `tools/league-dresscheck.js` against the ESPN mock (19 checks).
+
 Three advisor sources (`ADVISOR` auto-detected, overridable):
 - **external** (default when no API key): a Claude Code session is the advisor — it
   runs `tools/advisor-watch.js` in the background, gets woken when advice is wanted,
@@ -55,6 +69,8 @@ Three advisor sources (`ADVISOR` auto-detected, overridable):
   loads it and disables season polling — how season features are tested off-season.
 - `tools/make-sample-csv.js` — generates a test rankings CSV from the replay data.
 - `tools/espn-probe.js` — dumps + converts a real ESPN league (run before an ESPN draft night).
+- `tools/league-dresscheck.js` — multi-league e2e against the ESPN mock: create league, connect,
+  isolation from main, watcher wake with `league`, submit `--league`, background polling, remove.
 - `tools/espn-mock.js` + `tools/espn-fixture.js` — synthetic ESPN API for rehearsals
   (`ESPN_BASE=http://127.0.0.1:3998 node server.js`); the fixture builder also feeds selftest.
 - `tools/dresscheck.js` — headless client that runs a full replay and verifies the

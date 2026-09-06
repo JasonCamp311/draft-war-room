@@ -337,6 +337,14 @@ S.ST.players.r1.inj = '';
   eq(unk.unknownIds, [555], 'unknown id reported');
   eq(unk.picks[0].player_id, 'espn:555', 'unknown pick keeps id');
   eq(S.espnToDraft(buildLeague({ teams: 12, picks: [], ppr: 0.5 }), { lookup, resolve }).meta.metadata.scoring_type, 'half_ppr', 'half ppr');
+  // real ESPN pre-draft doc: every pick row exists with playerId -1 (seen live 2026-09-06, 8 teams x 16 = 128 rows)
+  const pre = S.espnToDraft(buildLeague({ teams: 8, slots: { 0: 1, 2: 2, 4: 2, 6: 1, 23: 1, 16: 1, 17: 1, 20: 7, 21: 1 }, picks: Array.from({ length: 128 }, () => ({ playerId: -1 })), pickOrder: [4, 6, 5, 1, 3, 7, 2, 8], drafted: false, inProgress: false }), { teamId: 7, lookup, resolve });
+  eq(pre.picks.length, 0, 'placeholder -1 picks are not picks');
+  eq(pre.meta.status, 'pre_draft', 'placeholder board is pre_draft');
+  eq(pre.meta.settings.rounds, 16, 'rounds from real 8-team roster');
+  eq(pre.mySlot, 6, 'team 7 drafts 6th in that order');
+  const dstPick = S.espnToDraft(buildLeague({ teams: 8, picks: [{ playerId: 103 }] }), { lookup, resolve }).picks;
+  eq(dstPick.length, 1, 'real picks still count');
   eq(S.espnToDraft(buildLeague({ teams: 12, picks: [], type: 'AUCTION' }), { lookup, resolve }).meta.type, 'auction', 'auction flagged');
   // the converted meta drives the existing snake math unchanged
   eq(S.pickToSlot(11, c.meta).slot, 10, 'pickToSlot on espn meta');

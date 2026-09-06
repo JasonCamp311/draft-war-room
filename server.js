@@ -173,6 +173,7 @@ function newCtx(id, dir, name) {
     sse: new Set(),         // SSE viewers of THIS league
     staticPrefix: null,     // cached-prompt block (byte-stable)
     prewarmedPrefix: null,
+    espnRelay: null,        // {raw, at, league_id, season} pushed by a logged-in browser tab (no cookies needed)
   };
 }
 
@@ -879,7 +880,11 @@ async function pollOnce() {
 }
 
 function pollStatus() {
-  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR, source: ST.session.source || 'sleeper', profile: PROFILE, port: PORT };
+  const relay = ST.ctx.espnRelay;
+  return {
+    degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR, source: ST.session.source || 'sleeper', profile: PROFILE, port: PORT,
+    via: ST.poll.via || null, relayAge: relay ? Math.round((Date.now() - relay.at) / 1000) : null,
+  };
 }
 
 // ------------------------------------------------- 7b. ESPN adapter + poller
@@ -932,6 +937,26 @@ function espnLeagueUrl(leagueId, season) {
 
 async function fetchEspnLeague(leagueId, season) {
   return fetchJson(espnLeagueUrl(leagueId, season), { headers: espnHeaders() }, 12000);
+}
+
+// Browser relay: espn_s2 is an HttpOnly cookie, so instead of copying it out of
+// DevTools a logged-in ESPN tab can push the league document here every few
+// seconds (tools/espn-relay.js prints the snippet). Fresh = within RELAY_FRESH_MS.
+const RELAY_FRESH_MS = 20000;
+function espnRelayFor(ctx, leagueId) {
+  const r = ctx.espnRelay;
+  if (!r || String(r.league_id) !== String(leagueId)) return null;
+  return r;
+}
+function espnRelayFresh(ctx, leagueId) { const r = espnRelayFor(ctx, leagueId); return r && Date.now() - r.at < RELAY_FRESH_MS ? r : null; }
+// Get the league document: a fresh relay copy wins; else the API with cookies; else the last relay copy (stale, flagged).
+async function espnLeagueDoc(ctx, leagueId, season, headers) {
+  const fresh = espnRelayFresh(ctx, leagueId);
+  if (fresh) return { raw: fresh.raw, via: 'relay', age: Date.now() - fresh.at };
+  if (headers.cookie) return { raw: await fetchJson(espnLeagueUrl(leagueId, season), { headers }, 12000), via: 'api', age: 0 };
+  const stale = espnRelayFor(ctx, leagueId);
+  if (stale) { const e = new Error(`browser relay stale (${Math.round((Date.now() - stale.at) / 1000)}s old) and no cookies — is the ESPN tab still open?`); e.stale = stale; throw e; }
+  const e = new Error('private league: no cookies and no browser relay yet'); e.status = 401; throw e;
 }
 
 // ESPN player directory (id -> {n, pos, t}); cached per season for 24h. Used to
@@ -1010,7 +1035,9 @@ function espnToDraft(raw, opts = {}) {
   const members = new Map((raw.members || []).map(m => [m.id, m.displayName || `${m.firstName || ''} ${m.lastName || ''}`.trim()]));
   const positionalSlot = (round, rpn) => (type === 'auction' ? rpn : (round % 2 === 1 ? rpn : teamCount - rpn + 1));
   const dd = raw.draftDetail || {};
-  const rawPicks = (dd.picks || []).filter(p => p && p.playerId != null && p.playerId !== 0 && p.overallPickNumber > 0)
+  // ESPN pre-populates EVERY pick slot with playerId -1 before it is made (real league: 128 rows, all -1
+  // pre-draft). D/ST ids are negative too, but far below -1 (e.g. -16002). Only real picks count.
+  const rawPicks = (dd.picks || []).filter(p => p && p.playerId != null && p.playerId !== 0 && p.playerId !== -1 && p.overallPickNumber > 0)
     .sort((a, b) => a.overallPickNumber - b.overallPickNumber);
   // slot per team: pickOrder first, else infer from round-1 picks
   const slotOfTeam = new Map(order.map((tid, i) => [tid, i + 1]));
@@ -1054,8 +1081,11 @@ async function pollEspnOnce() {
     pollTick++;
     const headers = espnHeaders();                       // cookies read while this league is active
     await loadEspnPlayers(e.season);
-    const raw = await fetchJson(espnLeagueUrl(e.league_id, e.season), { headers }, 12000);
     activate(ctx);
+    const doc = await espnLeagueDoc(ctx, e.league_id, e.season, headers);
+    activate(ctx);
+    const raw = doc.raw;
+    ST.poll.via = doc.via;
     if (`${(ST.session.espn || {}).league_id}|${(ST.session.espn || {}).season}` !== key) return scheduleNextPoll(ESPN_POLL_MS);   // switched mid-fetch
     let conv = espnToDraft(raw, { teamId: e.team_id });
     if (conv.unknownIds.length) {
@@ -2793,6 +2823,30 @@ const server = http.createServer(async (req, res) => {
     const ctx = resolveCtx(url, req);      // which league this request is about
     activate(ctx);                         // (re-activated again after every await below)
 
+    // ---- ESPN browser relay (cross-origin POST from a logged-in espn.com tab) ----
+    if (p === '/api/espn/relay') {
+      const origin = req.headers.origin || '';
+      const cors = /^https:\/\/([a-z0-9-]+\.)*espn\.com$/i.test(origin) ? { 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, x-league', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-max-age': '600' } : {};
+      if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
+      const body = JSON.parse(await readBody(req, 30 * 1024 * 1024)); activate(ctx);
+      const leagueId = String(body.league_id || (body.raw && body.raw.id) || '');
+      if (!leagueId || !body.raw || typeof body.raw !== 'object') { res.writeHead(400, { 'content-type': 'application/json', ...cors }); return res.end(JSON.stringify({ error: 'league_id + raw required' })); }
+      // deliver to every league that is connected to this ESPN league (or the request's league if none is yet)
+      let targets = [...ST.leagues.values()].filter(c => c.session.source === 'espn' && c.session.espn && String(c.session.espn.league_id) === leagueId);
+      if (!targets.length) targets = [ctx];
+      for (const c of targets) {
+        c.espnRelay = { raw: body.raw, at: Date.now(), league_id: leagueId, season: Number(body.season) || null };
+        if (c.poll.running && c.session.source === 'espn') withCtx(c, () => scheduleNextPoll(0));   // apply immediately
+      }
+      res.writeHead(200, { 'content-type': 'application/json', ...cors });
+      return res.end(JSON.stringify({ ok: true, leagues: targets.map(c => c.id), picks: ((body.raw.draftDetail || {}).picks || []).filter(x => x && x.playerId != null && x.playerId !== 0 && x.playerId !== -1).length }));
+    }
+    if (p === '/api/espn/relay/status') {
+      const r = ctx.espnRelay;
+      return json(res, 200, { league_id: r ? r.league_id : null, ageSec: r ? Math.round((Date.now() - r.at) / 1000) : null, fresh: !!(r && Date.now() - r.at < RELAY_FRESH_MS) });
+    }
+
     // ---- league registry ----
     if (p === '/api/leagues' && req.method === 'GET') return json(res, 200, leaguesView());
     if (p === '/api/leagues' && req.method === 'POST') {
@@ -2855,6 +2909,21 @@ const server = http.createServer(async (req, res) => {
       return res.end(gz ? zlib.gzipSync(body) : body);
     }
 
+    if (p === '/api/rankings/copy' && req.method === 'POST') {
+      // reuse another league's imported rankings (same CSV, this league's roster/VORP math)
+      const body = JSON.parse(await readBody(req)); activate(ctx);
+      const from = ST.leagues.get(String(body.from || 'main'));
+      if (!from || !from.rankings.length) return json(res, 404, { error: 'source league has no rankings' });
+      if (from === ctx) return json(res, 400, { error: 'same league' });
+      ST.rankings = JSON.parse(JSON.stringify(from.rankings));
+      ST.rankingsMeta = { ...from.rankingsMeta, importedAt: Date.now(), copiedFrom: from.id };
+      saveJson('rankings.json', { rows: ST.rankings, meta: ST.rankingsMeta });
+      computeVorp(); rebuildStaticPrefix(); computeBoard();
+      broadcast('rankings', { meta: ST.rankingsMeta, rankings: ST.rankings });
+      broadcast('board', ST.board);
+      return json(res, 200, { ok: true, rows: ST.rankings.length, name: ST.rankingsMeta.name });
+    }
+
     if (p === '/api/rankings' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req)); activate(ctx);
       const meta = importRankings(body.csvText, body.name);
@@ -2881,11 +2950,11 @@ const server = http.createServer(async (req, res) => {
         const headers = espnHeaders();
         try {
           await loadEspnPlayers(season); activate(ctx);
-          raw = await fetchJson(espnLeagueUrl(leagueId, season), { headers }, 12000); activate(ctx);
+          raw = (await espnLeagueDoc(ctx, leagueId, season, headers)).raw; activate(ctx);
         } catch (e) {
           activate(ctx);
           ST.session.espn = prevEspn;
-          const hint = e.status === 401 || e.status === 403 ? ' — private league? paste espn_s2 + SWID cookies' : (e.status === 404 ? ' — check league id / season' : '');
+          const hint = e.status === 401 || e.status === 403 ? ' — private league: paste espn_s2 + SWID cookies, or start the browser relay (node tools/espn-relay.js)' : (e.status === 404 ? ' — check league id / season' : '');
           return json(res, 502, { error: `could not fetch ESPN league: ${e.message}${hint}` });
         }
         const teamId = body.team_id != null && body.team_id !== '' ? Number(body.team_id) : null;

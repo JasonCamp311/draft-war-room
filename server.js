@@ -27,7 +27,13 @@ const zlib = require('zlib');
 
 // ---------------------------------------------------------------- 1. config
 
-const PORT = Number(process.env.PORT || 8484);
+// Profiles: one server per league. `node server.js --profile bros --port 8485`
+// (or PROFILE/PORT env) keeps that league's session/rankings/advice under
+// data/profiles/<name>/ while the big player caches stay shared in data/.
+const ARGV = process.argv.slice(2);
+const argOf = (k) => { const i = ARGV.indexOf(k); return i >= 0 ? ARGV[i + 1] : null; };
+const PROFILE = String(argOf('--profile') || process.env.PROFILE || '').replace(/[^A-Za-z0-9_-]/g, '') || null;
+const PORT = Number(argOf('--port') || process.env.PORT || 8484);
 const REPLAY = process.env.REPLAY === '1' || process.argv.includes('--replay');
 const REPLAY_PORT = Number(process.env.REPLAY_PORT || 3999);
 const MOCK_LLM = process.env.MOCK_LLM === '1';
@@ -43,7 +49,8 @@ const POLL_MS = Number(process.env.POLL_MS || (REPLAY ? 1000 : 2000));
 const SEASON_POLL_MS = Number(process.env.SEASON_POLL_MS || 60000);
 const SEASON_FIXTURE = process.env.SEASON_FIXTURE === '1';   // load data/season-fixture.json, no season polling
 const PLAYERS_REFRESH_MS = Number(process.env.PLAYERS_REFRESH_MS || 4 * 3600 * 1000);
-const DATA_DIR = path.join(__dirname, 'data');
+const SHARED_DIR = path.join(__dirname, 'data');                                   // player caches (shared by every profile)
+const DATA_DIR = PROFILE ? path.join(SHARED_DIR, 'profiles', PROFILE) : SHARED_DIR;   // this league's state
 const SLEEPER_REAL = 'https://api.sleeper.app/v1';
 const SLEEPER_BASE = REPLAY ? `http://127.0.0.1:${REPLAY_PORT}/v1` : SLEEPER_REAL;
 // Undocumented Sleeper host for projections/stats (different host from the v1 API).
@@ -69,20 +76,20 @@ async function fetchJson(url, opts = {}, timeoutMs = 15000) {
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-function loadJson(name, fallback) {
+function loadJson(name, fallback, dir = DATA_DIR) {
   try {
-    const p = path.join(DATA_DIR, name);
+    const p = path.join(dir, name);
     if (!fs.existsSync(p)) return fallback;
     return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch (e) { warn(`corrupt ${name}, using fallback:`, e.message); return fallback; }
 }
 
 const saveTimers = {};
-function saveJson(name, obj) {          // debounced atomic write
+function saveJson(name, obj, dir = DATA_DIR) {          // debounced atomic write
   clearTimeout(saveTimers[name]);
   saveTimers[name] = setTimeout(() => {
     try {
-      const p = path.join(DATA_DIR, name);
+      const p = path.join(dir, name);
       fs.writeFileSync(p + '.tmp', JSON.stringify(obj));
       fs.renameSync(p + '.tmp', p);
     } catch (e) { warn(`save ${name} failed:`, e.message); }
@@ -153,7 +160,7 @@ const PLAYERS_TTL_MS = 24 * 3600 * 1000;
 const PLAYERS_CACHE_V = 2;   // v2 adds inj (injury_status) + dpo (depth_chart_order)
 
 async function loadPlayers(opts = {}) {
-  const cache = loadJson('players-cache.json', null);
+  const cache = loadJson('players-cache.json', null, SHARED_DIR);
   const cacheOk = cache && cache.v === PLAYERS_CACHE_V;
   if (!opts.force && cacheOk && Date.now() - cache.fetchedAt < PLAYERS_TTL_MS) {
     ST.players = cache.players;
@@ -180,7 +187,7 @@ async function loadPlayers(opts = {}) {
     }
     ST.players = trimmed;
     ST.playersFetchedAt = Date.now();
-    fs.writeFileSync(path.join(DATA_DIR, 'players-cache.json'), JSON.stringify({ v: PLAYERS_CACHE_V, fetchedAt: ST.playersFetchedAt, players: trimmed }));
+    fs.writeFileSync(path.join(SHARED_DIR, 'players-cache.json'), JSON.stringify({ v: PLAYERS_CACHE_V, fetchedAt: ST.playersFetchedAt, players: trimmed }));
     log(`players cache refreshed: ${Object.keys(trimmed).length} fantasy-relevant players`);
   } catch (e) {
     if (cache) { ST.players = cache.players; ST.playersFetchedAt = cache.fetchedAt; warn(`players fetch failed (${e.message}); using STALE cache from ${new Date(cache.fetchedAt).toISOString()}`); }
@@ -738,7 +745,7 @@ async function pollOnce() {
 }
 
 function pollStatus() {
-  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR, source: ST.session.source || 'sleeper' };
+  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR, source: ST.session.source || 'sleeper', profile: PROFILE, port: PORT };
 }
 
 // ------------------------------------------------- 7b. ESPN adapter + poller
@@ -801,7 +808,7 @@ async function loadEspnPlayers(season) {
   if (espnPlayers.loading) return espnPlayers.loading;
   espnPlayers.loading = (async () => {
     const name = `espn-players-${ESPN_BASE.includes('espn.com') ? '' : 'mock-'}${season}.json`;   // a mock's ids must never poison the real cache
-    const cache = loadJson(name, null);
+    const cache = loadJson(name, null, SHARED_DIR);
     if (cache && Date.now() - cache.fetchedAt < PLAYERS_TTL_MS) {
       espnPlayers.season = season; espnPlayers.byId = cache.byId; espnPlayers.fetchedAt = cache.fetchedAt;
       log(`espn players ${season}: ${Object.keys(cache.byId).length} from cache`);
@@ -813,7 +820,7 @@ async function loadEspnPlayers(season) {
       const byId = {};
       for (const p of (Array.isArray(list) ? list : [])) { const row = espnPlayerRow(p); if (row && row.pos) byId[p.id] = row; }
       espnPlayers.season = season; espnPlayers.byId = byId; espnPlayers.fetchedAt = Date.now();
-      saveJson(name, { fetchedAt: espnPlayers.fetchedAt, byId });
+      saveJson(name, { fetchedAt: espnPlayers.fetchedAt, byId }, SHARED_DIR);
       log(`espn players ${season}: ${Object.keys(byId).length} fetched`);
     } catch (e) {
       if (cache) { espnPlayers.season = season; espnPlayers.byId = cache.byId; espnPlayers.fetchedAt = cache.fetchedAt; }
@@ -831,7 +838,7 @@ async function espnLookupIds(leagueId, season, ids) {
   const j = await fetchJson(url, { headers: espnHeaders({ 'x-fantasy-filter': JSON.stringify(filter) }) }, 12000);
   let n = 0;
   for (const e of (j && j.players) || []) { const row = espnPlayerRow(e.player || e); if (row) { espnPlayers.byId[e.id != null ? e.id : e.player.id] = row; n++; } }
-  if (n) saveJson(`espn-players-${season}.json`, { fetchedAt: espnPlayers.fetchedAt || Date.now(), byId: espnPlayers.byId });
+  if (n) saveJson(`espn-players-${ESPN_BASE.includes('espn.com') ? '' : 'mock-'}${season}.json`, { fetchedAt: espnPlayers.fetchedAt || Date.now(), byId: espnPlayers.byId }, SHARED_DIR);
   return n;
 }
 
@@ -3052,7 +3059,7 @@ process.on('unhandledRejection', (e) => { warn('unhandledRejection:', e && (e.st
   if (savedAdvice && Array.isArray(savedAdvice.history)) ST.adv.season.history = savedAdvice.history;
   loadSeasonFromDisk();
   server.listen(PORT, () => {
-    log(`Draft War Room on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''}${SEASON_FIXTURE ? ' [SEASON_FIXTURE]' : ''} effort=${EFFORT}`);
+    log(`Draft War Room${PROFILE ? ` [profile: ${PROFILE}]` : ''} on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''}${SEASON_FIXTURE ? ' [SEASON_FIXTURE]' : ''} effort=${EFFORT}`);
     if (ADVISOR === 'external') log('EXTERNAL ADVISOR mode — advice comes from a Claude session (tools/advisor-watch.js wakes it; POST /api/advisor/submit delivers; 📋 in the UI copies the prompt for manual paste)');
     else if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) warn('ANTHROPIC_API_KEY is not set — advisor disabled, fallback board only');
     if (ST.session.draft_id || (ST.session.source === 'espn' && ST.session.espn && ST.session.espn.league_id)) {

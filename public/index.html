@@ -601,6 +601,7 @@ function renderStatus() {
   if (degraded) { dot.className = 'dot bad'; txt.textContent = provider() + ' degraded — retrying (state kept)'; return; }
   dot.className = 'dot ok';
   const bits = [];
+  if (st.profile) { bits.push(st.profile.toUpperCase()); document.title = st.profile + ' · War Room'; document.querySelector('header h1').textContent = 'WAR ROOM · ' + st.profile; }
   if (st.replay) bits.push('REPLAY');
   if (st.advisor === 'external') bits.push('CLAUDE ADVISOR');
   else if (st.mockLLM) bits.push('MOCK LLM');

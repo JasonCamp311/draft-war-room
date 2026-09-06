@@ -63,6 +63,9 @@ Three advisor sources (`ADVISOR` auto-detected, overridable):
   normalization, CSV parsing, needs model). Run after any change to those.
 - `data/` (gitignored) — `players-cache.json` (24 h TTL), `rankings.json`,
   `session.json`, `replay-data.json`. Deleting `data/` is a full factory reset.
+  `--profile <name> --port N` (or PROFILE/PORT env) = one server per league: state
+  under `data/profiles/<name>/`, player caches (`players-cache.json`, `espn-players-*`)
+  shared from `data/` (SHARED_DIR). Tools take `--server http://localhost:N`.
 
 ## Run
 

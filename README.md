@@ -48,7 +48,27 @@ Pick how you want the advice generated:
 
 Everything the app stores lives in `data/` (gitignored): player cache, your
 rankings, league/draft connection, notes, advice history. Delete it for a
-factory reset. Sleeper's API is read-only, so nothing here can change your
+factory reset.
+
+### Several leagues at once
+
+One server = one league. For more, run one server per league, each with a
+**profile** and its own port. Profiles keep their own session, rankings, notes
+and advice under `data/profiles/<name>/`; the 5 MB player caches are shared.
+
+```powershell
+node server.js                                  # default league  -> http://localhost:8484
+node server.js --profile work  --port 8485      # second league   -> http://localhost:8485
+node server.js --profile bros  --port 8486      # third league    -> http://localhost:8486
+```
+
+The header shows the profile name so the tabs are easy to tell apart. Connect a
+different Sleeper draft / ESPN league in each, import that league's rankings,
+done. A Claude Code advisor session can serve several at once by pointing the
+tools at each server: `node tools/advisor-watch.js --server http://localhost:8485`
+and `node tools/advisor-submit.js --server http://localhost:8485 …`. Switching a
+single server to a different league is just Connect again with the new
+ID — the previous draft's state is replaced. Sleeper's API is read-only, so nothing here can change your
 league — lineup and waiver moves are still made in the Sleeper app.
 
 ---

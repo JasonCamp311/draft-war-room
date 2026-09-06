@@ -287,3 +287,97 @@ recommendation keeps streaming server-side and re-attaches on refresh).
   - **Final clean run: PASS.** 15/15 turns visible at 0-1 ms (all precomputed),
     kill test fired/surfaced/recovered, zero problems, RSS 56 -> 67 MB,
     44 requests (16 completed / 23 invalidated-by-design / 5 from the kill).
+
+## 2026-08-29 — external advisor mode (Claude Code session as the advisor)
+
+**Why:** draft night is tonight and no ANTHROPIC_API_KEY exists on this machine;
+user chose to use their Claude Code session (subscription) instead of API billing.
+
+**Changes:**
+- `ADVISOR` mode const: `api` (key set) / `mock` (MOCK_LLM=1) / `external`
+  (default with no key; overridable via env). External mode never calls Anthropic.
+- New endpoints: `GET /api/advisor/context` (needAdvice gate + `?prompt=1`
+  dynamic board message + `?full=1` static briefing) and
+  `POST /api/advisor/submit {basedOn, text}` (strict-format advice; 400 on
+  unparseable; stale-tagged when basedOn < live pickCount, and need re-fires).
+- `externalNeedAdvice()`: within SPECULATE_WITHIN of my pick with no
+  current-board rec, or ↻ force (works pre-draft to pre-bake a round-1 rec;
+  ignored after complete). External branch of advisorOnBoardChange broadcasts
+  reasoning/idle phases + instant (stale-)precomputed recs at turn start.
+- `tools/advisor-watch.js`: background waker (polls context, prints context+prompt
+  JSON and exits when advice needed / draft complete; exit 2 after 45s server-down).
+  `tools/advisor-submit.js`: delivery helper. Both avoid `process.exit()` — it
+  races live fetch handles and crashes libuv on Windows (exit 127, async.c assert).
+- UI: 📋 copy-prompt button (~14KB briefing+board, for manual claude.ai paste as
+  backup), CLAUDE ADVISOR status bit, info banner, CLAUDE tag on external recs,
+  external "working" label. `idle` phase clears a stuck spinner if a turn passes
+  unadvised.
+- selftest 40 → 52 assertions (need-gating matrix + format parsing).
+
+**Dress rehearsal (replay 12s/pick, Claude Code session actually advising):**
+- Wake→advise→submit loop verified end to end: watcher exit wakes the session,
+  advice renders in the UI tagged CLAUDE; stale submissions re-fire need and the
+  refresh loop converges; on-clock turns show the last rec at 0-1ms.
+- 12s auto-picks outpace a ~30-45s advise round trip (expected: real clock is
+  2 min); paused-replay turn confirmed clean in-window non-stale submission.
+- Mid-draft server kill + restart: full recovery from data/ (draft, rankings,
+  slot, polling). Accidental 30s Sleeper outage test: poller backed off and
+  recovered per design.
+
+## 2026-08-30 — Season mode: full-fledged fantasy helper
+
+Expanded post-draft into a season-long assistant (plan: season subsystem PARALLEL
+to draft; draft paths untouched except 4 backward-compatible seams).
+
+- **Server** (+~900 lines, sections 11-13): season poller (60s base, 5min/30min
+  tiers, own backoff, never dies), season math (optimalLineup greedy w/ flex
+  eligibility + hard-out exclusion, blended ROS values pre-rank↔PPG, waivers
+  composite, trade eval/scan, power scores, computeSeason view), per-kind prompts.
+  Players cache v2 adds injury_status/depth-chart (+4h in-season refresh).
+  Advisor generalized to kinds lineup|waiver|trade|matchup|power with freshness
+  token w{week}.r{adviceRev} (adviceRev only bumps on advice-invalidating changes).
+- **UI**: tabbed (Dashboard | Lineup | Waivers | Trade | Draft), season SSE events,
+  per-kind advice cards, trade builder w/ instant server eval.
+- **Tools**: advisor-watch --season (pending-question wake), advisor-submit --kind
+  --based-on-token, new season-snapshot.js fixture builder (--week/--synth/
+  --records/--injure) + SEASON_FIXTURE=1 server mode.
+- **Verified**: selftest 95/95 (new season block caught 2 real bugs: Out players
+  occupied optimal slots and leaked their proj into totals); live league connect
+  (roster auto-guessed from draft slot_to_roster_id: slot 9 → roster 1); full
+  ask→watch→submit loop; all 5 prompt builders; trade eval sane (CeeDee↔CMC
+  +3.9/-4.7); week-5 synth fixture (injury override, bye flags, PPG blend);
+  draft dresscheck regression PASS 15/15 turns w/ season poller running
+  concurrently; browser check clean (no console errors).
+- Stats endpoint verified same shape as projections (2025 wk17 probe) — shared
+  parser. Restored real FantasyPros rankings (518 rows) after regression
+  overwrote them with the sample CSV.
+
+## 2026-08-31 — Season mode round 2: scoreboard, odds, alerts, recap, phone
+
+- **Live scoreboard**: NFL schedule feed (api.sleeper.com/schedule, per-game
+  status) verified + wired in; current-week live stats fetched every 60s while
+  any game is live (mid-tier otherwise). Matchup view gains per-starter rows
+  (pts/proj/status) + yet-to-play counts; UI renders a two-sided scoreboard.
+  Lineup prompt now states LOCKED players (live/final games) instead of the
+  "can't see locks" caveat.
+- **Playoff odds**: Monte Carlo (3k sims, Normal(strength, 22), seed by wins
+  then PF) over real remaining league pairings (fetched once per week per
+  week). Cached by state key. Standings column + roster header pct.
+- **Bye planner**: CSV byes grouped per week, crunch flag at 3+ meaningful
+  players (chips on Dashboard; real data flagged W10·4⚠ immediately).
+- **Injury/drop alerts**: injSeen diffing (silent first seed) + my-player in
+  trending-drop list (dedup/week); alert strip + clear route; persisted.
+  First boot flagged a real one: NE DEF trending drop.
+- **Recap kind** (kind=recap, 📰 on League wire): matchupHistory archived at
+  rollover + backfilled; computeRecap = result, bench regret via hindsight
+  optimalLineup over actuals, best/benched scorers, league results; prompt
+  includes my prior advice lines that week (adviceHistory now persisted).
+- **Notes**: dblclick roster player -> note; notes ride into lineup/waiver/
+  trade prompts.
+- **Phone**: responsive pass (<=760px collapse, scrollable tabs, coarse-pointer
+  targets, sun hidden on small screens). Server already binds 0.0.0.0; needs
+  one-time elevated firewall rule (see README) then http://tars:8484 on tailnet.
+- season-snapshot.js now synthesizes matchup history + captures the schedule so
+  recap/scoreboard test off-season. Fixture drill verified recap prompt e2e.
+- selftest: 110 assertions (adds bye plan, seeded playoff odds, recap math,
+  alert seeding/dedupe).

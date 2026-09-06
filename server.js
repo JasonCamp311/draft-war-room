@@ -14,6 +14,9 @@
  *   8. advisor engine (speculative requests, stale guards, latency log)
  *   9. Anthropic streaming client (raw fetch SSE) + mock LLM
  *  10. SSE hub + HTTP server / routes
+ *  11. season poller (league/rosters/matchups/projections, slow-cadence, never dies)
+ *  12. season math (pure: optimal lineup, values, waivers, trades, power)
+ *  13. season prompts (briefing + per-kind builders for the external advisor)
  */
 
 const http = require('http');
@@ -27,12 +30,23 @@ const PORT = Number(process.env.PORT || 8484);
 const REPLAY = process.env.REPLAY === '1' || process.argv.includes('--replay');
 const REPLAY_PORT = Number(process.env.REPLAY_PORT || 3999);
 const MOCK_LLM = process.env.MOCK_LLM === '1';
+// Advisor source: 'api' (Anthropic), 'mock' (testing), or 'external' — a Claude
+// Code session (or manual paste) generates advice; the server serves the prompt
+// context at GET /api/advisor/context and accepts POST /api/advisor/submit.
+// External is the default whenever no API key is set.
+const ADVISOR = process.env.ADVISOR ||
+  (MOCK_LLM ? 'mock' : (process.env.ANTHROPIC_API_KEY ? 'api' : 'external'));
 const EFFORT = process.env.EFFORT || 'high';           // low|medium|high|xhigh|max
 const SPECULATE_WITHIN = Number(process.env.SPECULATE_WITHIN || 2);
 const POLL_MS = Number(process.env.POLL_MS || (REPLAY ? 1000 : 2000));
+const SEASON_POLL_MS = Number(process.env.SEASON_POLL_MS || 60000);
+const SEASON_FIXTURE = process.env.SEASON_FIXTURE === '1';   // load data/season-fixture.json, no season polling
+const PLAYERS_REFRESH_MS = Number(process.env.PLAYERS_REFRESH_MS || 4 * 3600 * 1000);
 const DATA_DIR = path.join(__dirname, 'data');
 const SLEEPER_REAL = 'https://api.sleeper.app/v1';
 const SLEEPER_BASE = REPLAY ? `http://127.0.0.1:${REPLAY_PORT}/v1` : SLEEPER_REAL;
+// Undocumented Sleeper host for projections/stats (different host from the v1 API).
+const SLEEPER_STATS = 'https://api.sleeper.com';
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-fable-5';
 
@@ -73,8 +87,9 @@ function saveJson(name, obj) {          // debounced atomic write
 
 // Global state. Everything the UI needs lives here and survives restarts via data/.
 const ST = {
-  players: {},            // id -> {n, p, t, sr}
+  players: {},            // id -> {n, p, t, sr, inj, dpo}
   nameIndex: null,        // built after players load
+  playersFetchedAt: 0,    // for in-season staleness labeling + 4h refresh
   rankings: [],           // resolved CSV rows
   rankingsMeta: null,     // {name, importedAt, matchStats}
   session: loadJson('session.json', { draft_id: null, my_slot: null, manual: {}, notes: {} }),
@@ -84,25 +99,52 @@ const ST = {
   adv: {                  // advisor engine state
     seq: 0, inflight: null, latest: null, latency: [],
     killLLM: false,       // debug: simulate Anthropic outage
+    season: { pending: {}, latest: {}, history: [] },   // kind -> {since, params} / kind -> rec / past advice lines
+  },
+  season: {               // in-season subsystem (parallel to draft; own poll loop)
+    league: null, users: [], rosters: [],
+    nfl: { week: null, season: null, season_type: null },
+    matchups: null, transactions: [],
+    proj: { week: null, byId: {}, fetchedAt: 0, degraded: true, count: 0 },
+    stats: { byWeek: {} },              // completed weeks -> {pid: pts}
+    liveStats: { week: null, byId: {}, fetchedAt: 0 },   // current week, refreshed fast during games
+    schedule: { byWeek: {}, fetchedAt: 0 },              // byWeek[w][TEAM] = {status, date, opp}
+    leagueSchedule: {},                 // league pairings: week -> [{roster_id, matchup_id}]
+    matchupHistory: {},                 // completed weeks -> matchups array (for recaps)
+    injSeen: {},                        // my players' last-seen injury status (alert diffing)
+    alerts: [],                         // [{pid, name, kind, from, to, at, week}]
+    odds: null,                         // cached playoff-odds sim {key, pct}
+    trending: { add: [], drop: [], fetchedAt: 0 },
+    rev: 0,                             // bumped on any data change; advice freshness token
+    sig: {},                            // change-detection signatures per dataset
+    poll: { failures: 0, degraded: false, lastOkAt: 0, timer: null, running: false, tick: 0 },
+    view: null,                         // computeSeason() output
   },
   sse: new Set(),
   staticPrefix: null,     // cached-prompt block (byte-stable)
 };
+// session.json v2: league identity rides alongside the draft fields.
+if (ST.session.league_id === undefined) ST.session.league_id = null;
+if (ST.session.my_roster_id === undefined) ST.session.my_roster_id = null;
+if (ST.session.my_user_id === undefined) ST.session.my_user_id = null;
 
 // ------------------------------------------------- 3. players cache (24h TTL)
 
 const PLAYERS_TTL_MS = 24 * 3600 * 1000;
+const PLAYERS_CACHE_V = 2;   // v2 adds inj (injury_status) + dpo (depth_chart_order)
 
-async function loadPlayers() {
+async function loadPlayers(opts = {}) {
   const cache = loadJson('players-cache.json', null);
-  if (cache && Date.now() - cache.fetchedAt < PLAYERS_TTL_MS) {
+  const cacheOk = cache && cache.v === PLAYERS_CACHE_V;
+  if (!opts.force && cacheOk && Date.now() - cache.fetchedAt < PLAYERS_TTL_MS) {
     ST.players = cache.players;
-    log(`players cache: ${Object.keys(ST.players).length} players (age ${((Date.now() - cache.fetchedAt) / 3600e3).toFixed(1)}h)`);
+    ST.playersFetchedAt = cache.fetchedAt;
+    log(`players cache v${PLAYERS_CACHE_V}: ${Object.keys(ST.players).length} players (age ${((Date.now() - cache.fetchedAt) / 3600e3).toFixed(1)}h)`);
     buildNameIndex();
     return;
   }
   try {
-    log('fetching Sleeper players/nfl (~5MB, cached 24h)...');
+    log(`fetching Sleeper players/nfl (~5MB, cached 24h)${cache && !cacheOk ? ' [cache v' + (cache.v || 1) + ' invalidated]' : ''}...`);
     // Always the real API — the replay mock does not carry the 5MB blob.
     const full = await fetchJson(`${SLEEPER_REAL}/players/nfl`, {}, 60000);
     const trimmed = {};
@@ -113,16 +155,35 @@ async function loadPlayers() {
       trimmed[id] = {
         n: p.full_name || `${p.first_name || ''} ${p.last_name || ''}`.trim(),
         p: p.position, t: p.team || '', sr,
+        inj: p.injury_status || '',
+        dpo: typeof p.depth_chart_order === 'number' ? p.depth_chart_order : null,
       };
     }
     ST.players = trimmed;
-    fs.writeFileSync(path.join(DATA_DIR, 'players-cache.json'), JSON.stringify({ fetchedAt: Date.now(), players: trimmed }));
+    ST.playersFetchedAt = Date.now();
+    fs.writeFileSync(path.join(DATA_DIR, 'players-cache.json'), JSON.stringify({ v: PLAYERS_CACHE_V, fetchedAt: ST.playersFetchedAt, players: trimmed }));
     log(`players cache refreshed: ${Object.keys(trimmed).length} fantasy-relevant players`);
   } catch (e) {
-    if (cache) { ST.players = cache.players; warn(`players fetch failed (${e.message}); using STALE cache from ${new Date(cache.fetchedAt).toISOString()}`); }
+    if (cache) { ST.players = cache.players; ST.playersFetchedAt = cache.fetchedAt; warn(`players fetch failed (${e.message}); using STALE cache from ${new Date(cache.fetchedAt).toISOString()}`); }
     else throw new Error(`players fetch failed and no cache exists: ${e.message}`);
   }
   buildNameIndex();
+}
+
+// In-season: injuries/teams change daily. Refresh the cache in the background
+// when it ages past PLAYERS_REFRESH_MS. Called from the season poll loop only,
+// so draft-day boot behavior is unchanged. Failures are non-fatal (stale cache stays).
+let playersRefreshing = false;
+async function maybeRefreshPlayers() {
+  if (playersRefreshing || Date.now() - ST.playersFetchedAt < PLAYERS_REFRESH_MS) return false;
+  playersRefreshing = true;
+  try {
+    const before = JSON.stringify(Object.values(ST.players).map(p => p.inj + '|' + p.t));
+    await loadPlayers({ force: true });
+    const after = JSON.stringify(Object.values(ST.players).map(p => p.inj + '|' + p.t));
+    return before !== after;
+  } catch (e) { warn('players refresh failed (non-fatal):', e.message); return false; }
+  finally { playersRefreshing = false; }
 }
 
 // ------------------------------------- 4. normalization + player matching
@@ -652,10 +713,22 @@ async function pollOnce() {
 }
 
 function pollStatus() {
-  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY };
+  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR };
 }
 
 // --------------------------------- 8. advisor engine (speculative, guarded)
+
+// External mode: is a (fresh) recommendation wanted right now?
+function externalNeedAdvice() {
+  if (ADVISOR !== 'external') return false;
+  const b = ST.board;
+  if (!b || !b.mySlot || !ST.rankings.length) return false;
+  // manual ↻ forces even outside the window and pre-draft (pre-bakes a round-1 rec)
+  if (ST.adv.extForce && b.status !== 'complete') return true;
+  if (b.status !== 'drafting') return false;
+  if (b.picksUntilMine == null || b.picksUntilMine > SPECULATE_WITHIN) return false;
+  return !(ST.adv.latest && ST.adv.latest.basedOn === b.pickCount);
+}
 
 function advisorOnBoardChange() {
   const b = ST.board;
@@ -669,6 +742,26 @@ function advisorOnBoardChange() {
     ST.adv.turns.push(ST.adv.turn);
   } else if (!b.onClock) ST.adv.turn = null;
   const withinWindow = b.picksUntilMine <= SPECULATE_WITHIN;   // 0 = on the clock
+  if (ADVISOR === 'external') {
+    // External mode: advice arrives via POST /api/advisor/submit. Here we only
+    // (a) surface the last submitted rec the moment my turn starts and
+    // (b) broadcast a "working" state + timestamp the need so the watcher and
+    //     latency log have something to key on. No requests to abort.
+    const latest = ST.adv.latest;
+    if (b.onClock && latest) {
+      broadcast('advice', adviceEvent(latest));
+      markVisible(latest.basedOn === b.pickCount ? 'precomputed' : 'stale-precomputed');
+    }
+    if (externalNeedAdvice()) {
+      if (!ST.adv.extNeedSince) ST.adv.extNeedSince = Date.now();
+      broadcast('advice', { phase: 'reasoning', external: true, seq: ST.adv.seq + 1, basedOn: b.pickCount, speculative: !b.onClock });
+    } else if (!withinWindow) {
+      ST.adv.extNeedSince = null;
+      // clears a stuck "working…" spinner if a turn passed without a submission
+      broadcast('advice', { phase: 'idle', external: true, seq: ST.adv.seq + 1, basedOn: b.pickCount });
+    }
+    return;
+  }
   if (!withinWindow) {
     // outside window: cancel any in-flight speculation, keep last completed
     if (ST.adv.inflight) abortInflight('outside-window');
@@ -728,11 +821,13 @@ function adviceEvent(rec) {
   return {
     seq: rec.seq, basedOn: rec.basedOn, phase: 'done', stale: rec.basedOn !== (ST.board ? ST.board.pickCount : rec.basedOn),
     text: rec.text, parsed: rec.parsed, pickLine: rec.pickLine, mock: rec.mock || false,
+    external: rec.external || false,
     timings: rec.timings,
   };
 }
 
 function startAdvice(board) {
+  if (ADVISOR === 'external') { advisorOnBoardChange(); return; }
   if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) {
     broadcast('advice', { phase: 'error', basedOn: board.pickCount, error: 'ANTHROPIC_API_KEY not set — using fallback board', seq: ++ST.adv.seq });
     if (board.onClock) markVisible('fallback-no-key');
@@ -1043,6 +1138,1198 @@ async function mockAdvise(board, signal, h) {
   return { stopReason: 'end_turn' };
 }
 
+// ------------------------------------------------- 11. season poller
+//
+// Parallel to the draft poller: its own loop, cadence, and backoff. Base tick
+// 60s; rosters/matchups/transactions every tick, trending+projections ~5min,
+// state/league/users/players-refresh ~30min. Every iteration is wrapped;
+// failures back off (cap 5min) and auto-recover; state is never dropped.
+
+function seasonWeek() { return ST.season.nfl.week || 1; }
+// Advice freshness token: week + adviceRev. adviceRev bumps only on changes
+// that actually invalidate advice (rosters, week rollover, injury statuses) —
+// NOT on noisy data like live scores or trending counts.
+function seasonToken() { return `w${seasonWeek()}.r${ST.season.adviceRev || 0}`; }
+function myRosterId() { return ST.session.my_roster_id != null ? Number(ST.session.my_roster_id) : null; }
+function round1(x) { return x == null || !isFinite(x) ? null : Math.round(x * 10) / 10; }
+
+function saveSeason() {
+  const se = ST.season;
+  saveJson('season.json', {
+    league: se.league, users: se.users, rosters: se.rosters, nfl: se.nfl,
+    matchups: se.matchups, transactions: se.transactions, trending: se.trending,
+    proj: se.proj, stats: se.stats, adviceRev: se.adviceRev || 0,
+    schedule: se.schedule, matchupHistory: se.matchupHistory, injSeen: se.injSeen, alerts: se.alerts,
+  });
+}
+
+function loadSeasonFromDisk() {
+  const d = loadJson(SEASON_FIXTURE ? 'season-fixture.json' : 'season.json', null);
+  if (!d) return;
+  const se = ST.season;
+  for (const k of ['league', 'users', 'rosters', 'nfl', 'matchups', 'transactions', 'trending', 'proj', 'stats',
+    'schedule', 'matchupHistory', 'injSeen', 'alerts']) {
+    if (d[k] !== undefined && d[k] !== null) se[k] = d[k];
+  }
+  se.adviceRev = d.adviceRev || 0;
+  se.nfl = se.nfl || { week: null, season: null, season_type: null };
+  se.proj = se.proj || { week: null, byId: {}, fetchedAt: 0, degraded: true, count: 0 };
+  se.stats = se.stats || { byWeek: {} };
+  se.trending = se.trending || { add: [], drop: [], fetchedAt: 0 };
+  if (SEASON_FIXTURE && d.injOverride) {          // fixture-only injury statuses (--injure)
+    for (const [pid, status] of Object.entries(d.injOverride)) if (ST.players[pid]) ST.players[pid].inj = status;
+  }
+  computeSeason();
+  if (SEASON_FIXTURE) log('SEASON FIXTURE loaded from data/season-fixture.json — season polling disabled');
+  else if (se.league) log(`season state restored: ${se.league.name} week ${se.nfl.week || '?'}`);
+}
+
+// Positions this league actually starts (drives projections/stats queries).
+const FLEX_ELIG = { FLEX: ['RB', 'WR', 'TE'], SUPER_FLEX: ['QB', 'RB', 'WR', 'TE'], REC_FLEX: ['WR', 'TE'], WRRB_FLEX: ['RB', 'WR'] };
+function leaguePositions() {
+  const rp = (ST.season.league && ST.season.league.roster_positions) || [];
+  const set = new Set();
+  for (const s of rp) {
+    if (FLEX_ELIG[s]) FLEX_ELIG[s].forEach(p => set.add(p));
+    else if (FANTASY_POS.has(s)) set.add(s);
+  }
+  return set.size ? [...set] : ['QB', 'RB', 'WR', 'TE', 'K', 'DEF'];
+}
+
+function startSeasonPolling() {
+  if (ST.season.poll.running || SEASON_FIXTURE) return;
+  ST.season.poll.running = true;
+  scheduleNextSeasonPoll(0);
+  log(`season polling league ${ST.session.league_id} every ${SEASON_POLL_MS}ms`);
+}
+
+function scheduleNextSeasonPoll(delay) {
+  clearTimeout(ST.season.poll.timer);
+  ST.season.poll.timer = setTimeout(() => { seasonPollOnce().catch(e => warn('seasonPollOnce escaped:', e.message)); }, delay);
+  ST.season.poll.timer.unref && ST.season.poll.timer.unref();
+}
+
+async function seasonPollOnce(force) {
+  const lid = ST.session.league_id;
+  const se = ST.season;
+  if (!lid) { se.poll.running = false; return; }
+  let delay = SEASON_POLL_MS;
+  let changed = false, advChanged = false;
+  const mark = (name, data) => {           // JSON-signature change detection
+    const sig = JSON.stringify(data);
+    if (se.sig[name] !== sig) { se.sig[name] = sig; changed = true; return true; }
+    return false;
+  };
+  try {
+    se.poll.tick++;
+    const t = se.poll.tick;
+    const slow = force || t === 1 || t % 30 === 0;   // ~30 min
+    const mid = force || t === 1 || t % 5 === 0;     // ~5 min
+
+    if (slow) {
+      const st = await fetchJson(`${SLEEPER_REAL}/state/nfl`, {}, 10000);
+      const week = Math.max(1, Number(st.leg || st.week) || 1);
+      const prevWeek = se.nfl.week;
+      se.nfl = { week, season: String(st.season), season_type: st.season_type };
+      mark('nfl', se.nfl);
+      if (prevWeek && prevWeek !== week) {
+        log(`NFL week rollover: ${prevWeek} -> ${week}`);
+        if (se.matchups && se.matchups.length) se.matchupHistory[prevWeek] = se.matchups;  // archive for recaps
+        se.matchups = null; se.transactions = [];
+        se.proj = { week: null, byId: {}, fetchedAt: 0, degraded: true, count: 0 };
+        se.liveStats = { week: null, byId: {}, fetchedAt: 0 };
+        broadcast('toast', { kind: 'info', msg: `Week ${week} — matchups and projections refreshing.` });
+        advChanged = true;
+      }
+      se.league = await fetchJson(`${SLEEPER_REAL}/league/${lid}`, {}, 10000);
+      mark('league', { s: se.league.settings, n: se.league.name });
+      se.users = await fetchJson(`${SLEEPER_REAL}/league/${lid}/users`, {}, 10000);
+      mark('users', se.users.map(u => u.user_id + '|' + u.display_name));
+      if (await maybeRefreshPlayers()) { changed = true; advChanged = true; }
+      // league future pairings for the playoff-odds sim (fetch each remaining week once per week)
+      try {
+        const lastReg = (se.league.settings && se.league.settings.playoff_week_start || 15) - 1;
+        for (let w = week + 1; w <= lastReg; w++) {
+          if (se.leagueSchedule[w]) continue;
+          const mus = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${w}`, {}, 10000);
+          se.leagueSchedule[w] = (mus || []).map(m => ({ roster_id: m.roster_id, matchup_id: m.matchup_id }));
+        }
+      } catch (e) { warn('league schedule fetch failed (non-fatal):', e.message); }
+    }
+    if (!se.nfl.week) throw new Error('NFL week unknown (state fetch pending)');
+    const wk = se.nfl.week;
+
+    // NFL schedule (game statuses drive the live scoreboard + lock badges).
+    // Fetched on the mid tier normally, every tick while any game is live.
+    const fetchSchedule = async () => {
+      const rows = await fetchJson(`${SLEEPER_STATS}/schedule/nfl/regular/${se.nfl.season}`, {}, 15000);
+      const byWeek = {};
+      for (const g of rows || []) {
+        if (!g || !g.week || !g.home || !g.away) continue;
+        (byWeek[g.week] = byWeek[g.week] || {})[normTeam(g.home)] = { status: g.status, date: g.date, opp: normTeam(g.away) };
+        byWeek[g.week][normTeam(g.away)] = { status: g.status, date: g.date, opp: normTeam(g.home) };
+      }
+      se.schedule = { byWeek, fetchedAt: Date.now() };
+      mark('schedule', Object.values(byWeek[wk] || {}).map(x => x.status));
+    };
+    const liveNow = Object.values((se.schedule.byWeek || {})[wk] || {})
+      .some(g => g.status && g.status !== 'pre_game' && g.status !== 'complete');
+    if (mid || liveNow || !se.schedule.fetchedAt) {
+      try { await fetchSchedule(); } catch (e) { warn('schedule fetch failed (non-fatal):', e.message); }
+    }
+    // current-week live stats: every tick during games, mid tier otherwise
+    if (mid || liveNow) {
+      try {
+        const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
+        const rows = await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000);
+        const { byId } = parseStatRows(rows, se.league && se.league.scoring_settings);
+        const pts = {}; for (const [pid, r] of Object.entries(byId)) if (r.pts != null) pts[pid] = r.pts;
+        se.liveStats = { week: wk, byId: pts, fetchedAt: Date.now() };
+        mark('livestats', Math.round(Object.values(pts).reduce((a, b) => a + b, 0)));
+      } catch (e) { warn('live stats fetch failed (non-fatal):', e.message); }
+    }
+
+    if (mid) {
+      try {
+        const [add, drop] = await Promise.all([
+          fetchJson(`${SLEEPER_REAL}/players/nfl/trending/add?lookback_hours=24&limit=75`, {}, 10000),
+          fetchJson(`${SLEEPER_REAL}/players/nfl/trending/drop?lookback_hours=24&limit=75`, {}, 10000),
+        ]);
+        se.trending = { add, drop, fetchedAt: Date.now() };
+        mark('trending', add.slice(0, 25).map(x => x.player_id));   // ids only; counts churn constantly
+      } catch (e) { warn('trending fetch failed (non-fatal):', e.message); }
+      try {
+        const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
+        const rows = await fetchJson(`${SLEEPER_STATS}/projections/nfl/${se.nfl.season}/${wk}?season_type=regular&${pos}`, {}, 20000);
+        const { byId, count } = parseStatRows(rows, se.league && se.league.scoring_settings);
+        se.proj = { week: wk, byId, fetchedAt: Date.now(), degraded: count < 50, count };
+        mark('proj', { week: wk, count });
+      } catch (e) { warn('projections fetch failed (non-fatal):', e.message); se.proj.degraded = true; }
+      // backfill one completed week of actuals per cycle (no bursts)
+      let missingWeek = null;
+      for (let w = 1; w < wk; w++) if (!se.stats.byWeek[w]) { missingWeek = w; break; }
+      if (missingWeek) {
+        try {
+          const pos = leaguePositions().map(p => `position[]=${p}`).join('&');
+          const rows = await fetchJson(`${SLEEPER_STATS}/stats/nfl/${se.nfl.season}/${missingWeek}?season_type=regular&${pos}`, {}, 20000);
+          const { byId } = parseStatRows(rows, se.league && se.league.scoring_settings);
+          const pts = {}; for (const [pid, r] of Object.entries(byId)) if (r.pts != null) pts[pid] = r.pts;
+          se.stats.byWeek[missingWeek] = pts;
+          changed = true;
+          log(`week ${missingWeek} actuals cached (${Object.keys(pts).length} players)`);
+        } catch (e) { warn('stats fetch failed (non-fatal):', e.message); }
+      }
+      // backfill one completed week of league matchup results (recap material)
+      let missingMu = null;
+      for (let w = 1; w < wk; w++) if (!se.matchupHistory[w]) { missingMu = w; break; }
+      if (missingMu) {
+        try {
+          se.matchupHistory[missingMu] = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${missingMu}`, {}, 10000);
+          changed = true;
+          log(`week ${missingMu} matchup results archived`);
+        } catch (e) { warn('matchup history fetch failed (non-fatal):', e.message); }
+      }
+    }
+
+    // every tick: rosters, matchups, transactions
+    const rosters = await fetchJson(`${SLEEPER_REAL}/league/${lid}/rosters`, {}, 10000);
+    if (ST.session.league_id !== lid) return scheduleNextSeasonPoll(SEASON_POLL_MS);  // league switched mid-fetch
+    se.rosters = rosters;
+    if (mark('rosters', rosters.map(r => [r.roster_id, r.players, r.starters, r.settings && r.settings.wins]))) advChanged = true;
+    try {
+      const mus = await fetchJson(`${SLEEPER_REAL}/league/${lid}/matchups/${wk}`, {}, 10000);
+      se.matchups = mus;
+      mark('matchups', (mus || []).map(m => [m.roster_id, m.matchup_id, m.points]));
+    } catch (e) { warn('matchups fetch failed (non-fatal):', e.message); }
+    try {
+      const txs = await fetchJson(`${SLEEPER_REAL}/league/${lid}/transactions/${wk}`, {}, 10000);
+      se.transactions = txs || [];
+      mark('transactions', (txs || []).map(x => x.transaction_id + '|' + x.status));
+    } catch (e) { warn('transactions fetch failed (non-fatal):', e.message); }
+
+    if (checkInjuryAlerts()) { changed = true; advChanged = true; }
+
+    if (se.poll.failures > 0) log(`season poll recovered after ${se.poll.failures} failure(s)`);
+    se.poll.failures = 0; se.poll.degraded = false; se.poll.lastOkAt = Date.now();
+    if (advChanged) se.adviceRev = (se.adviceRev || 0) + 1;
+    if (changed || advChanged) {
+      se.rev++;
+      computeSeason();
+      broadcast('season', se.view);
+      saveSeason();
+    }
+  } catch (e) {
+    se.poll.failures++;
+    se.poll.degraded = se.poll.failures >= 2;
+    delay = Math.min(300000, SEASON_POLL_MS * 2 ** Math.min(se.poll.failures - 1, 3));
+    warn(`season poll failure #${se.poll.failures}: ${e.message}; retry in ${delay}ms`);
+    if (se.view) { se.view.degraded = se.poll.degraded; broadcast('season', se.view); }
+  }
+  scheduleNextSeasonPoll(delay);
+}
+
+// Injury / trending-drop alerts for MY players. First sighting of a player
+// seeds injSeen silently (no boot-time flood); afterwards any status change
+// becomes an alert. A my-player showing up in the league-wide trending-drop
+// list is a "something happened" signal, alerted once per week.
+function checkInjuryAlerts() {
+  const se = ST.season;
+  const myRid = myRosterId();
+  const myR = myRid ? se.rosters.find(r => r.roster_id === myRid) : null;
+  if (!myR) return false;
+  let changed = false;
+  const push = (a) => {
+    se.alerts.unshift(a);
+    if (se.alerts.length > 12) se.alerts.length = 12;
+    changed = true;
+    log(`alert: ${a.name} ${a.kind === 'inj' ? `${a.from || 'healthy'} -> ${a.to || 'healthy'}` : 'is trending as a DROP league-wide'}`);
+  };
+  const mine = new Set(myR.players || []);
+  for (const pid of mine) {
+    const pl = ST.players[pid]; if (!pl) continue;
+    const now = pl.inj || '';
+    const seen = se.injSeen[pid];
+    if (seen === undefined) { se.injSeen[pid] = now; continue; }        // seed silently
+    if (seen !== now) {
+      push({ pid, name: pl.n, kind: 'inj', from: seen, to: now, at: Date.now(), week: seasonWeek() });
+      se.injSeen[pid] = now;
+    }
+  }
+  for (const pid of Object.keys(se.injSeen)) if (!mine.has(pid)) delete se.injSeen[pid];
+  for (const t of (se.trending.drop || [])) {
+    const pid = String(t.player_id);
+    if (!mine.has(pid)) continue;
+    if (se.alerts.some(a => a.pid === pid && a.kind === 'drop' && a.week === seasonWeek())) continue;
+    push({ pid, name: (ST.players[pid] || {}).n || pid, kind: 'drop', from: null, to: null, at: Date.now(), week: seasonWeek() });
+  }
+  return changed;
+}
+
+// ------------------------------------------------- 12. season math (pure)
+
+// Points for a stat row in this league's scoring (standard families only —
+// this league is full PPR; custom stat-by-stat scoring is out of scope).
+function projPoints(stats, scoring) {
+  if (!stats) return null;
+  const rec = scoring && typeof scoring.rec === 'number' ? scoring.rec : 1;
+  const key = rec >= 1 ? 'pts_ppr' : rec >= 0.5 ? 'pts_half_ppr' : 'pts_std';
+  const v = stats[key];
+  return typeof v === 'number' ? v : null;
+}
+
+// Shared parser for the undocumented api.sleeper.com projections AND stats
+// endpoints (verified same row shape). Defensive: skips anything malformed.
+function parseStatRows(rows, scoring) {
+  const byId = {}; let count = 0;
+  if (!Array.isArray(rows)) return { byId, count };
+  for (const r of rows) {
+    if (!r || !r.player_id) continue;
+    const pts = projPoints(r.stats, scoring);
+    byId[r.player_id] = { pts, opp: r.opponent || null };
+    if (pts != null) count++;
+  }
+  return { byId, count };
+}
+
+// Rest-of-season value per player: preseason draft-board curve blended with
+// in-season PPG. Scale: rank 1 ≈ 100; a 25-PPG week-in-week-out stud ≈ 100.
+// Early season trusts the draft board; by week 6 the games take over.
+function buildValueIndex() {
+  const se = ST.season;
+  const map = new Map();
+  const rankByPid = new Map(ST.rankings.filter(r => r.player_id).map(r => [r.player_id, r.rank]));
+  const weeks = Object.keys(se.stats.byWeek);
+  const blendW = Math.min(1, weeks.length / 6);
+  const ids = new Set([...Object.keys(se.proj.byId), ...rankByPid.keys()]);
+  for (const w of weeks) for (const pid of Object.keys(se.stats.byWeek[w])) ids.add(pid);
+  for (const pid of ids) {
+    const rank = rankByPid.get(pid);
+    const pre = rank ? 1000 / (rank + 9) : 0;
+    let sum = 0, n = 0;
+    for (const w of weeks) { const p = se.stats.byWeek[w][pid]; if (p != null) { sum += p; n++; } }
+    const ppg = n ? sum / n : null;
+    const value = ppg != null ? (1 - blendW) * pre + blendW * ppg * 4 : pre;
+    map.set(pid, { value, ppg: ppg != null ? round1(ppg) : null, pre: round1(pre) });
+  }
+  return map;
+}
+
+const HARD_OUT = new Set(['Out', 'IR', 'PUP', 'Sus', 'NA', 'COV', 'DNR']);
+
+// Optimal starting lineup by projections. Greedy: highest effective projection
+// first, dedicated slot before flex, most-restrictive eligible flex first —
+// optimal under nested flex eligibility. getInfo(pid) -> {pos, proj, eff, out}.
+// Hard-out players (Out/IR/...) score 0; Questionable/Doubtful keep their proj.
+function optimalLineup(playerIds, rosterPositions, getInfo) {
+  const slots = [];
+  for (const s of rosterPositions) {
+    if (s === 'BN' || s === 'IR' || s === 'TAXI') continue;
+    slots.push({ slot: s, elig: new Set(FLEX_ELIG[s] || [s]), pid: null, proj: null, eff: 0 });
+  }
+  const ranked = playerIds.map(pid => {
+    const g = getInfo(pid) || {};
+    return { pid, pos: g.pos, proj: g.proj, out: !!g.out, eff: g.out ? 0 : (g.eff != null ? g.eff : (g.proj || 0)) };
+  }).sort((a, b) => b.eff - a.eff);
+  for (const p of ranked) {
+    if (p.out) continue;                               // never start a hard-out player
+    const open = slots.filter(s => !s.pid && s.elig.has(p.pos));
+    if (!open.length) continue;
+    open.sort((a, b) => a.elig.size - b.elig.size);
+    open[0].pid = p.pid; open[0].proj = p.proj; open[0].eff = p.eff;
+  }
+  const total = slots.reduce((a, s) => a + (s.pid ? (s.proj || 0) : 0), 0);
+  return { slots, total };
+}
+
+// Per-player lineup info closure used by lineup/trade math. Bye/no-game logic:
+// a CSV bye matching this week, or a healthy projection feed with no row for
+// the player, means he is not playing -> effective 0. A missing projection on
+// a DEGRADED feed falls back to a pseudo-projection from blended value so
+// early-week ordering stays sane (flagged noProj).
+function lineupInfo(values) {
+  const se = ST.season;
+  const week = seasonWeek();
+  const rowByPid = new Map(ST.rankings.filter(r => r.player_id).map(r => [r.player_id, r]));
+  return (pid) => {
+    const pl = ST.players[pid] || {};
+    const e = se.proj.byId[pid];
+    const proj = e && e.pts != null ? e.pts : null;
+    const row = rowByPid.get(pid);
+    const onBye = !!(row && row.bye != null && row.bye === week) || (!se.proj.degraded && !e);
+    const v = values.get(pid);
+    let eff;
+    if (onBye) eff = 0;
+    else if (proj != null) eff = proj;
+    else eff = v && v.value ? Math.min(30, 3 + v.value * 0.22) : 0;
+    return { pos: pl.p || '?', proj, eff, out: HARD_OUT.has(pl.inj), inj: pl.inj || '', onBye, noProj: proj == null };
+  };
+}
+
+// Optimal-vs-current lineup diff for any roster (mine on the Lineup tab,
+// opponent's in the matchup prompt).
+function computeLineup(roster, rosterPositions, values) {
+  const se = ST.season;
+  const info = lineupInfo(values);
+  const rowFor = (pid) => {
+    const pl = ST.players[pid] || {}; const g = info(pid);
+    const e = se.proj.byId[pid];
+    return {
+      pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', inj: pl.inj || '',
+      proj: round1(g.proj), opp: e ? e.opp : null, onBye: g.onBye, noProj: g.noProj,
+      value: round1((values.get(pid) || {}).value || 0),
+    };
+  };
+  const opt = optimalLineup(roster.players || [], rosterPositions, info);
+  const starterSlots = rosterPositions.filter(s => s !== 'BN' && s !== 'IR' && s !== 'TAXI');
+  const curPids = (roster.starters || []).map(x => (x && x !== '0') ? x : null);
+  const current = starterSlots.map((slot, i) => (curPids[i] ? { slot, ...rowFor(curPids[i]) } : { slot, empty: true }));
+  const optimal = opt.slots.map(s => (s.pid ? { slot: s.slot, ...rowFor(s.pid) } : { slot: s.slot, empty: true }));
+  const curSet = new Set(curPids.filter(Boolean));
+  const optSet = new Set(opt.slots.map(s => s.pid).filter(Boolean));
+  const swapIn = [...optSet].filter(p => !curSet.has(p)).map(rowFor);
+  const swapOut = [...curSet].filter(p => !optSet.has(p)).map(rowFor);
+  // current total counts Out/bye starters as 0 — that's the real cost of starting them
+  const curTotal = curPids.reduce((a, pid) => {
+    if (!pid) return a;
+    const g = info(pid);
+    return a + (g.out || g.onBye ? 0 : (g.proj || 0));
+  }, 0);
+  const flags = [];
+  for (const pid of curSet) {
+    const g = info(pid);
+    if (g.out) flags.push({ ...rowFor(pid), reason: `starting a player who is ${g.inj}` });
+    else if (g.onBye) flags.push({ ...rowFor(pid), reason: 'BYE / no game this week' });
+    else if (g.inj) flags.push({ ...rowFor(pid), reason: g.inj });
+    else if (g.noProj) flags.push({ ...rowFor(pid), reason: 'no projection' });
+  }
+  for (const c of current) if (c.empty) flags.push({ name: '(empty)', slot: c.slot, reason: 'EMPTY starting slot' });
+  // Close calls: benched players within 2.5 proj of the weakest optimal starter
+  // they could displace — the judgment calls Claude is for.
+  const closeCalls = [];
+  for (const pid of roster.players || []) {
+    if (optSet.has(pid)) continue;
+    const g = info(pid);
+    if (g.eff <= 0) continue;
+    const cands = opt.slots.filter(s => s.pid && s.elig.has(g.pos));
+    if (!cands.length) continue;
+    const weakest = cands.reduce((a, b) => ((a.eff || 0) <= (b.eff || 0) ? a : b));
+    const margin = (weakest.eff || 0) - g.eff;
+    if (margin < 2.5) closeCalls.push({ bench: rowFor(pid), starter: rowFor(weakest.pid), margin: round1(margin) });
+  }
+  closeCalls.sort((a, b) => a.margin - b.margin);
+  return {
+    current, optimal, swapIn, swapOut, flags, closeCalls: closeCalls.slice(0, 6),
+    curTotal: round1(curTotal), optTotal: round1(opt.total), gain: round1(opt.total - curTotal),
+    degraded: se.proj.degraded,
+  };
+}
+
+// Starters needed per position for this league (flex apportioned like computeVorp).
+function startersNeeded() {
+  const rp = (ST.season.league && ST.season.league.roster_positions) || [];
+  const ded = {}; let flex = 0, sflex = 0;
+  for (const s of rp) {
+    if (s === 'FLEX' || s === 'WRRB_FLEX' || s === 'REC_FLEX') flex++;
+    else if (s === 'SUPER_FLEX') sflex++;
+    else if (FANTASY_POS.has(s)) ded[s] = (ded[s] || 0) + 1;
+  }
+  return {
+    QB: (ded.QB || 0) + sflex * 0.8, RB: (ded.RB || 0) + flex * 0.45,
+    WR: (ded.WR || 0) + flex * 0.45, TE: (ded.TE || 0) + flex * 0.10,
+    K: ded.K || 0, DEF: ded.DEF || 0,
+  };
+}
+
+// My per-position strength vs the league median -> waiver need labels.
+function computeNeedProfile(values) {
+  const se = ST.season;
+  const need = startersNeeded();
+  const myRid = myRosterId();
+  const strength = (roster, pos) => {
+    const k = Math.max(1, Math.round(need[pos] || 1));
+    return (roster.players || [])
+      .filter(pid => ST.players[pid] && ST.players[pid].p === pos)
+      .map(pid => (values.get(pid) || {}).value || 0)
+      .sort((a, b) => b - a).slice(0, k).reduce((a, b) => a + b, 0);
+  };
+  const needs = {}; const summary = [];
+  const myR = se.rosters.find(r => r.roster_id === myRid);
+  for (const pos of leaguePositions()) {
+    if (!need[pos]) continue;
+    const all = se.rosters.map(r => strength(r, pos)).sort((a, b) => a - b);
+    const median = all[Math.floor(all.length / 2)] || 0;
+    const mine = myR ? strength(myR, pos) : 0;
+    const ratio = median > 0 ? mine / median : 1;
+    needs[pos] = ratio < 0.8 ? 'high' : ratio < 0.95 ? 'med' : 'low';
+    summary.push({ pos, mine: round1(mine), median: round1(median), need: needs[pos] });
+  }
+  return { needs, summary };
+}
+
+// Waiver-wire candidates: (players with a projection ∪ trending adds) minus
+// every rostered player, scored by a stated composite of value + this-week
+// proj + trending heat + my positional need. Plus my droppable bench.
+function computeWaivers(values) {
+  const se = ST.season;
+  if (!se.rosters.length) return null;
+  const myRid = myRosterId();
+  const rostered = new Set();
+  for (const r of se.rosters) for (const pid of r.players || []) rostered.add(pid);
+  const trendAdd = new Map((se.trending.add || []).map(t => [String(t.player_id), t.count]));
+  const universe = new Set([...Object.keys(se.proj.byId), ...trendAdd.keys()]);
+  const profile = computeNeedProfile(values);
+  const cands = [];
+  for (const pid of universe) {
+    if (rostered.has(pid)) continue;
+    const pl = ST.players[pid]; if (!pl) continue;
+    const v = values.get(pid) || { value: 0, ppg: null };
+    const proj = (se.proj.byId[pid] || {}).pts;
+    const trend = trendAdd.get(pid) || 0;
+    const needBoost = profile.needs[pl.p] === 'high' ? 8 : profile.needs[pl.p] === 'med' ? 3 : 0;
+    const score = (v.value || 0) + (proj || 0) * 0.8 + Math.min(40, Math.sqrt(trend) / 12) + needBoost;
+    cands.push({
+      pid, name: pl.n, pos: pl.p, team: pl.t, inj: pl.inj || '',
+      proj: proj != null ? round1(proj) : null, trend, value: round1(v.value || 0),
+      ppg: v.ppg, need: profile.needs[pl.p] || 'low', score: round1(score),
+    });
+  }
+  cands.sort((a, b) => b.score - a.score);
+  let drops = [];
+  const myR = myRid ? se.rosters.find(r => r.roster_id === myRid) : null;
+  if (myR) {
+    const starters = new Set((myR.starters || []).filter(x => x && x !== '0'));
+    drops = (myR.players || []).filter(pid => !starters.has(pid)).map(pid => {
+      const pl = ST.players[pid] || {}; const v = values.get(pid) || {};
+      return {
+        pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', inj: pl.inj || '',
+        value: round1(v.value || 0), ppg: v.ppg != null ? v.ppg : null,
+        proj: round1((se.proj.byId[pid] || {}).pts),
+      };
+    }).sort((a, b) => (a.value || 0) - (b.value || 0)).slice(0, 5);
+  }
+  return {
+    candidates: cands.slice(0, 15), drops,
+    myWaiverPos: myR && myR.settings ? myR.settings.waiver_position : null,
+    needProfile: profile.summary,
+  };
+}
+
+// Trade evaluation: value totals each way + optimal-lineup totals for BOTH
+// rosters before and after the swap + resulting bench depth. All finished
+// numbers; Claude judges fairness and fit on top.
+function computeTradeEval(params) {
+  const se = ST.season;
+  const myRid = myRosterId();
+  const partner = se.rosters.find(r => r.roster_id === Number(params.partner_roster_id));
+  const myR = se.rosters.find(r => r.roster_id === myRid);
+  if (!myR) return { error: 'league connected but your roster is not set — pick your team first' };
+  if (!partner) return { error: 'unknown trade partner roster' };
+  const give = (params.give || []).map(String), get = (params.get || []).map(String);
+  if (!give.length && !get.length) return { error: 'empty trade' };
+  const mySet = new Set(myR.players || []), theirSet = new Set(partner.players || []);
+  const pname = (pid) => (ST.players[pid] || {}).n || pid;
+  for (const pid of give) if (!mySet.has(pid)) return { error: `you don't roster ${pname(pid)}` };
+  for (const pid of get) if (!theirSet.has(pid)) return { error: `partner doesn't roster ${pname(pid)}` };
+  const values = buildValueIndex();
+  const rp = se.league.roster_positions || [];
+  const info = lineupInfo(values);
+  const swap = (players, minus, plus) => players.filter(p => !minus.includes(p)).concat(plus);
+  const evalSide = (roster, minus, plus) => {
+    const before = optimalLineup(roster.players || [], rp, info).total;
+    const after = optimalLineup(swap(roster.players || [], minus, plus), rp, info).total;
+    return { before: round1(before), after: round1(after), delta: round1(after - before) };
+  };
+  const rowOf = (pid) => {
+    const pl = ST.players[pid] || {}; const v = values.get(pid) || {};
+    return {
+      pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', inj: pl.inj || '',
+      value: round1(v.value || 0), ppg: v.ppg != null ? v.ppg : null,
+      proj: round1((se.proj.byId[pid] || {}).pts),
+    };
+  };
+  const benchByPos = (players, starterPids) => {
+    const out = {};
+    for (const pid of players) {
+      if (starterPids.has(pid)) continue;
+      const pl = ST.players[pid]; if (!pl) continue;
+      out[pl.p] = (out[pl.p] || 0) + 1;
+    }
+    return out;
+  };
+  const depth = (players) => {
+    const opt = optimalLineup(players, rp, info);
+    return benchByPos(players, new Set(opt.slots.map(s => s.pid).filter(Boolean)));
+  };
+  const sumVal = (pids) => round1(pids.reduce((a, pid) => a + ((values.get(pid) || {}).value || 0), 0));
+  const dl = se.league.settings ? se.league.settings.trade_deadline : null;
+  return {
+    give: give.map(rowOf), get: get.map(rowOf),
+    giveValue: sumVal(give), getValue: sumVal(get),
+    myLineup: evalSide(myR, give, get),
+    theirLineup: evalSide(partner, get, give),
+    myDepthAfter: depth(swap(myR.players || [], give, get)),
+    theirDepthAfter: depth(swap(partner.players || [], get, give)),
+    partner: { roster_id: partner.roster_id },
+    deadlinePassed: !!(dl && seasonWeek() > dl),
+  };
+}
+
+// Trade scan: per-roster per-position surplus/deficit vs replacement value,
+// and the 3 most complementary trade partners for my profile.
+function computeTradeScan() {
+  const se = ST.season;
+  const values = buildValueIndex();
+  const myRid = myRosterId();
+  const need = startersNeeded();
+  const byPos = {};
+  for (const r of se.rosters) for (const pid of r.players || []) {
+    const pl = ST.players[pid]; if (!pl) continue;
+    (byPos[pl.p] = byPos[pl.p] || []).push((values.get(pid) || {}).value || 0);
+  }
+  const repl = {};
+  for (const [pos, arr] of Object.entries(byPos)) {
+    arr.sort((a, b) => b - a);
+    const idx = Math.max(0, Math.round((need[pos] || 1) * se.rosters.length) - 1);
+    repl[pos] = round1(arr[Math.min(idx, arr.length - 1)] || 0);
+  }
+  const matrix = se.rosters.map(r => {
+    const row = { roster_id: r.roster_id, mine: r.roster_id === myRid, surplus: {} };
+    for (const pos of Object.keys(need)) {
+      if (!need[pos]) continue;
+      const above = (r.players || []).filter(pid => {
+        const pl = ST.players[pid];
+        return pl && pl.p === pos && ((values.get(pid) || {}).value || 0) >= (repl[pos] || 0);
+      }).length;
+      row.surplus[pos] = round1(above - need[pos]);
+    }
+    return row;
+  });
+  const mine = matrix.find(m => m.mine);
+  const partners = !mine ? [] : matrix.filter(m => !m.mine).map(m => {
+    let score = 0;
+    for (const pos of Object.keys(mine.surplus)) {
+      score += Math.max(0, -mine.surplus[pos]) * Math.max(0, m.surplus[pos]);
+      score += Math.max(0, mine.surplus[pos]) * Math.max(0, -m.surplus[pos]);
+    }
+    return { roster_id: m.roster_id, complement: round1(score) };
+  }).sort((a, b) => b.complement - a.complement).slice(0, 3);
+  return { matrix, partners, replacement: repl };
+}
+
+// Playoff odds: Monte Carlo over the remaining league schedule. Each team's
+// weekly score ~ Normal(strength, 22) where strength blends projected lineup
+// strength with actual scoring pace. Seeding = wins, then total points (the
+// common Sleeper tiebreak). Cached by a key of everything that moves it.
+function computePlayoffOdds(teams, opts = {}) {
+  const se = ST.season;
+  const wk = seasonWeek();
+  const s = (se.league && se.league.settings) || {};
+  const lastReg = (s.playoff_week_start || 15) - 1;
+  const spots = s.playoff_teams || 6;
+  const rng = opts.rng || Math.random;
+  const sims = opts.sims || 3000;
+  const strengths = {};
+  for (const t of teams) {
+    const games = t.wins + t.losses + t.ties;
+    const pace = games ? t.fpts / games : null;
+    strengths[t.roster_id] = pace != null ? 0.5 * (t.optProj || 100) + 0.5 * pace : (t.optProj || 100);
+  }
+  // remaining schedule: current week's live pairings + fetched future pairings
+  const weeks = [];
+  const cur = (se.matchups || []).map(m => ({ roster_id: m.roster_id, matchup_id: m.matchup_id }));
+  if (wk <= lastReg && cur.length) weeks.push(cur);
+  for (let w = wk + 1; w <= lastReg; w++) if (se.leagueSchedule[w]) weeks.push(se.leagueSchedule[w]);
+  if (!weeks.length && teams.every(t => t.wins + t.losses + t.ties === 0)) {
+    // pre-season / no schedule yet: odds are meaningless
+    if (!weeks.length) return null;
+  }
+  const key = JSON.stringify([wk, spots, teams.map(t => [t.roster_id, t.wins, t.ties, Math.round(t.fpts)]),
+    Object.entries(strengths).map(([k, v]) => [k, Math.round(v)]), weeks.length]);
+  if (!opts.rng && se.odds && se.odds.key === key) return se.odds.pct;
+  const gauss = () => { let u = 0, v = 0; while (!u) u = rng(); while (!v) v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+  const made = {}; for (const t of teams) made[t.roster_id] = 0;
+  for (let i = 0; i < sims; i++) {
+    const wins = {}, pts = {};
+    for (const t of teams) { wins[t.roster_id] = t.wins + t.ties / 2; pts[t.roster_id] = t.fpts; }
+    for (const pairings of weeks) {
+      const byMu = {};
+      for (const p of pairings) { if (p.matchup_id != null) (byMu[p.matchup_id] = byMu[p.matchup_id] || []).push(p.roster_id); }
+      const scored = {};
+      for (const p of pairings) { scored[p.roster_id] = strengths[p.roster_id] + gauss() * 22; pts[p.roster_id] += scored[p.roster_id]; }
+      for (const pair of Object.values(byMu)) {
+        if (pair.length !== 2) continue;
+        wins[scored[pair[0]] >= scored[pair[1]] ? pair[0] : pair[1]] += 1;
+      }
+    }
+    const order = teams.map(t => t.roster_id).sort((a, b) => (wins[b] - wins[a]) || (pts[b] - pts[a]));
+    for (let j = 0; j < Math.min(spots, order.length); j++) made[order[j]]++;
+  }
+  const pct = {};
+  for (const t of teams) pct[t.roster_id] = Math.round((made[t.roster_id] / sims) * 100);
+  if (!opts.rng) se.odds = { key, pct };
+  return pct;
+}
+
+// Bye-week planner: my roster's byes (rankings CSV column) grouped by week,
+// flagged when 3+ meaningful players (value >= 8 or current starters) sit out.
+function computeByePlan(values) {
+  const se = ST.season;
+  const myRid = myRosterId();
+  const myR = myRid ? se.rosters.find(r => r.roster_id === myRid) : null;
+  if (!myR) return null;
+  const rowByPid = new Map(ST.rankings.filter(r => r.player_id).map(r => [r.player_id, r]));
+  const starters = new Set((myR.starters || []).filter(x => x && x !== '0'));
+  const byWeek = {};
+  for (const pid of myR.players || []) {
+    const row = rowByPid.get(pid);
+    if (!row || row.bye == null) continue;
+    const pl = ST.players[pid] || {};
+    (byWeek[row.bye] = byWeek[row.bye] || []).push({
+      pid, name: pl.n || pid, pos: pl.p || '?', starter: starters.has(pid),
+      value: round1((values.get(pid) || {}).value || 0),
+    });
+  }
+  return Object.entries(byWeek).map(([w, players]) => {
+    const meaningful = players.filter(p => p.starter || (p.value || 0) >= 8).length;
+    return { week: Number(w), players: players.sort((a, b) => (b.value || 0) - (a.value || 0)), crunch: meaningful >= 3, past: Number(w) < seasonWeek() };
+  }).sort((a, b) => a.week - b.week);
+}
+
+// Week-in-review numbers for the recap advice kind: my result, the league's
+// scores, and how many points my bench left on the table (optimal-with-
+// hindsight vs what my archived starters actually scored). Uses the CURRENT
+// roster for the hindsight lineup — close enough, and stated in the prompt.
+function computeRecap(week) {
+  const se = ST.season;
+  const myRid = myRosterId();
+  const mus = se.matchupHistory[week];
+  const actuals = se.stats.byWeek[week];
+  if (!mus || !mus.length || !actuals || !myRid) return null;
+  const teamName = (rid) => {
+    const t = (se.view && se.view.standings || []).find(x => x.roster_id === rid);
+    return t ? t.name : 'roster ' + rid;
+  };
+  const rp = (se.league && se.league.roster_positions) || [];
+  const results = [];
+  const byMu = {};
+  for (const m of mus) if (m.matchup_id != null) (byMu[m.matchup_id] = byMu[m.matchup_id] || []).push(m);
+  for (const pair of Object.values(byMu)) {
+    if (pair.length !== 2) continue;
+    const [a, b] = pair.slice().sort((x, y) => (y.points || 0) - (x.points || 0));
+    results.push({ winner: teamName(a.roster_id), wpts: round1(a.points || 0), loser: teamName(b.roster_id), lpts: round1(b.points || 0), mine: a.roster_id === myRid || b.roster_id === myRid });
+  }
+  const mine = mus.find(m => m.roster_id === myRid);
+  const opp = mine && mine.matchup_id != null ? mus.find(m => m.matchup_id === mine.matchup_id && m.roster_id !== myRid) : null;
+  let benchRegret = null, myOptimal = null, myActual = null, best = [], worst = [];
+  if (mine) {
+    myActual = round1(mine.points || 0);
+    const roster = se.rosters.find(r => r.roster_id === myRid);
+    const players = (mine.players && mine.players.length ? mine.players : (roster ? roster.players : [])) || [];
+    const info = (pid) => { const pl = ST.players[pid] || {}; const a = actuals[pid]; return { pos: pl.p || '?', proj: a != null ? a : 0, eff: a != null ? a : 0, out: false }; };
+    const opt = optimalLineup(players, rp, info);
+    myOptimal = round1(opt.total);
+    benchRegret = round1(Math.max(0, opt.total - (mine.points || 0)));
+    const scored = players.map(pid => ({ pid, name: (ST.players[pid] || {}).n || pid, pos: (ST.players[pid] || {}).p || '?', pts: round1(actuals[pid] != null ? actuals[pid] : 0), started: (mine.starters || []).includes(pid) }))
+      .sort((a, b) => b.pts - a.pts);
+    best = scored.slice(0, 3);
+    worst = scored.filter(p => p.started).slice(-3).reverse();
+  }
+  const high = results.length ? results.reduce((a, r) => (r.wpts > a.wpts ? r : a)) : null;
+  const low = results.length ? results.reduce((a, r) => (r.lpts < a.lpts ? r : a)) : null;
+  return {
+    week,
+    my: mine ? {
+      points: myActual, won: !!(opp && (mine.points || 0) > (opp.points || 0)),
+      opp: opp ? teamName(opp.roster_id) : null, oppPoints: opp ? round1(opp.points || 0) : null,
+      optimal: myOptimal, benchRegret, best, worst,
+    } : null,
+    results, high, low,
+  };
+}
+
+// The whole season view: standings + power, my roster, matchup, lineup,
+// waivers, transactions. Recomputed on any data change, shipped over SSE.
+function computeSeason() {
+  const se = ST.season;
+  if (!se.league || !Array.isArray(se.rosters) || !se.rosters.length) { se.view = null; return null; }
+  const myRid = myRosterId();
+  const userById = new Map((se.users || []).map(u => [u.user_id, u]));
+  const teamName = (r) => {
+    const u = userById.get(r.owner_id);
+    return (u && ((u.metadata && u.metadata.team_name) || u.display_name)) || `Roster ${r.roster_id}`;
+  };
+  const values = buildValueIndex();
+  const info = lineupInfo(values);
+  const rp = se.league.roster_positions || [];
+  const fpts = (s, k) => (s ? (s[k] || 0) + (s[k + '_decimal'] || 0) / 100 : 0);
+  const projOf = (pid) => { const e = se.proj.byId[pid]; return e && e.pts != null ? e.pts : null; };
+
+  const teams = se.rosters.map(r => {
+    const opt = optimalLineup(r.players || [], rp, info);
+    const curProj = (r.starters || []).reduce((a, pid) => a + (pid && pid !== '0' ? (projOf(pid) || 0) : 0), 0);
+    const s = r.settings || {};
+    return {
+      roster_id: r.roster_id, name: teamName(r), mine: r.roster_id === myRid,
+      wins: s.wins || 0, losses: s.losses || 0, ties: s.ties || 0,
+      fpts: round1(fpts(s, 'fpts')), fptsAgainst: round1(fpts(s, 'fpts_against')),
+      waiverPos: s.waiver_position != null ? s.waiver_position : null,
+      optProj: round1(opt.total), curProj: round1(curProj),
+      value: round1((r.players || []).reduce((a, pid) => a + ((values.get(pid) || {}).value || 0), 0)),
+    };
+  });
+  // Power score: stated composite of win%, points-for, projected lineup
+  // strength, and roster value — each min-max normalized across the league.
+  const norm = (arr) => { const mx = Math.max(...arr), mn = Math.min(...arr); return arr.map(v => (mx > mn ? (v - mn) / (mx - mn) : 0.5)); };
+  const wpct = teams.map(t => { const g = t.wins + t.losses + t.ties; return g ? (t.wins + t.ties / 2) / g : 0.5; });
+  const nW = norm(wpct), nF = norm(teams.map(t => t.fpts)), nO = norm(teams.map(t => t.optProj)), nV = norm(teams.map(t => t.value));
+  teams.forEach((t, i) => { t.power = round1(100 * (0.30 * nW[i] + 0.15 * nF[i] + 0.30 * nO[i] + 0.25 * nV[i])); });
+  const oddsPct = computePlayoffOdds(teams);
+  teams.forEach((t) => { t.odds = oddsPct ? oddsPct[t.roster_id] : null; });
+  const standings = teams.slice().sort((a, b) => (b.wins - a.wins) || (b.fpts - a.fpts));
+  standings.forEach((t, i) => { t.rank = i + 1; });
+  const teamByRid = new Map(teams.map(t => [t.roster_id, t]));
+
+  // game status + live points helpers (schedule statuses; live stats during games)
+  const wkGames = (se.schedule.byWeek || {})[se.nfl.week] || {};
+  const gsOf = (pid) => {
+    const pl = ST.players[pid]; if (!pl || !pl.t) return null;
+    const g = wkGames[pl.t]; if (!g) return 'bye';
+    return g.status === 'pre_game' ? 'pre' : g.status === 'complete' ? 'final' : 'live';
+  };
+  const liveOf = (pid) => (se.liveStats.week === se.nfl.week && se.liveStats.byId[pid] != null) ? se.liveStats.byId[pid] : null;
+  const liveNow = Object.values(wkGames).some(g => g.status && g.status !== 'pre_game' && g.status !== 'complete');
+
+  let myRoster = null, matchup = null, lineup = null;
+  const myR = myRid ? se.rosters.find(r => r.roster_id === myRid) : null;
+  if (myR) {
+    const starters = new Set((myR.starters || []).filter(x => x && x !== '0'));
+    myRoster = {
+      players: (myR.players || []).map(pid => {
+        const pl = ST.players[pid] || {}; const e = se.proj.byId[pid]; const g = info(pid);
+        return {
+          pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', inj: pl.inj || '',
+          proj: round1(projOf(pid)), opp: e ? e.opp : null, onBye: g.onBye,
+          value: round1((values.get(pid) || {}).value || 0),
+          ppg: (values.get(pid) || {}).ppg != null ? values.get(pid).ppg : null,
+          starter: starters.has(pid),
+        };
+      }).sort((a, b) => (b.starter - a.starter) || ((b.proj || 0) - (a.proj || 0))),
+    };
+    lineup = computeLineup(myR, rp, values);
+    const me = teamByRid.get(myRid);
+    if (se.matchups && se.matchups.length && me) {
+      const mine = se.matchups.find(m => m.roster_id === myRid);
+      const opp = mine && mine.matchup_id != null
+        ? se.matchups.find(m => m.matchup_id === mine.matchup_id && m.roster_id !== myRid) : null;
+      const oppTeam = opp ? teamByRid.get(opp.roster_id) : null;
+      if (mine) {
+        // per-starter scoreboard rows (live points + game status) for both sides
+        const starterDetail = (mu) => (mu.starters || []).filter(x => x && x !== '0').map(pid => {
+          const pl = ST.players[pid] || {}; const e = se.proj.byId[pid];
+          return {
+            pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', inj: pl.inj || '',
+            opp: e ? e.opp : null, proj: round1(projOf(pid)), pts: round1(liveOf(pid)), gs: gsOf(pid),
+          };
+        });
+        const yetToPlay = (rows) => rows.filter(r => r.gs === 'pre').length;
+        const myRows = starterDetail(mine);
+        const oppRows = opp ? starterDetail(opp) : [];
+        matchup = {
+          week: se.nfl.week, liveNow,
+          my: {
+            points: round1(mine.points || 0), proj: me.curProj, optProj: me.optProj,
+            record: `${me.wins}-${me.losses}${me.ties ? '-' + me.ties : ''}`, rank: me.rank, power: me.power,
+            starters: myRows, left: yetToPlay(myRows),
+          },
+          opp: oppTeam ? {
+            roster_id: oppTeam.roster_id, name: oppTeam.name,
+            points: round1(opp.points || 0), proj: oppTeam.curProj, optProj: oppTeam.optProj,
+            record: `${oppTeam.wins}-${oppTeam.losses}${oppTeam.ties ? '-' + oppTeam.ties : ''}`, rank: oppTeam.rank, power: oppTeam.power,
+            starters: oppRows, left: yetToPlay(oppRows),
+          } : null,
+        };
+      }
+    }
+  }
+
+  const nameOf = (pid) => (ST.players[pid] || {}).n || pid;
+  const ridName = (rid) => { const t = teamByRid.get(rid); return t ? t.name : 'roster ' + rid; };
+  const transactions = (se.transactions || []).slice()
+    .sort((a, b) => (b.status_updated || b.created || 0) - (a.status_updated || a.created || 0))
+    .slice(0, 20).map(tx => ({
+      id: tx.transaction_id, type: tx.type, status: tx.status,
+      at: tx.status_updated || tx.created || null,
+      teams: (tx.roster_ids || []).map(ridName),
+      adds: tx.adds ? Object.entries(tx.adds).map(([pid, rid]) => ({ name: nameOf(pid), pos: (ST.players[pid] || {}).p || '', to: ridName(rid) })) : [],
+      drops: tx.drops ? Object.entries(tx.drops).map(([pid, rid]) => ({ name: nameOf(pid), pos: (ST.players[pid] || {}).p || '', from: ridName(rid) })) : [],
+    }));
+
+  const dl = se.league.settings ? se.league.settings.trade_deadline : null;
+  se.view = {
+    week: se.nfl.week, season: se.nfl.season, rev: se.rev, token: seasonToken(),
+    leagueName: se.league.name, leagueId: ST.session.league_id, myRosterId: myRid,
+    tradeDeadline: dl, tradeDeadlinePassed: !!(dl && se.nfl.week > dl),
+    playoffWeekStart: se.league.settings ? se.league.settings.playoff_week_start : null,
+    waiverType: se.league.settings ? se.league.settings.waiver_type : null,
+    projDegraded: se.proj.degraded, projCount: se.proj.count,
+    playersAgeH: ST.playersFetchedAt ? round1((Date.now() - ST.playersFetchedAt) / 3600e3) : null,
+    degraded: se.poll.degraded, lastSyncAt: se.poll.lastOkAt, fixture: SEASON_FIXTURE,
+    liveNow, alerts: se.alerts.slice(0, 8),
+    byePlan: computeByePlan(values),
+    recapWeek: (se.nfl.week > 1 && se.matchupHistory[se.nfl.week - 1] && se.stats.byWeek[se.nfl.week - 1]) ? se.nfl.week - 1 : null,
+    standings, myRoster, matchup, lineup, transactions,
+    waivers: computeWaivers(values),
+    rosters: se.rosters.map(r => ({
+      roster_id: r.roster_id, name: teamName(r), mine: r.roster_id === myRid,
+      players: (r.players || []).map(pid => {
+        const pl = ST.players[pid] || {};
+        return { pid, name: pl.n || pid, pos: pl.p || '?', team: pl.t || '', value: round1((values.get(pid) || {}).value || 0) };
+      }).sort((a, b) => (b.value || 0) - (a.value || 0)),
+    })),
+    advicePending: Object.keys(ST.adv.season.pending),
+  };
+  return se.view;
+}
+
+// ---------------------- 13. season prompts (external advisor, per kind)
+
+const SEASON_KINDS = new Set(['lineup', 'waiver', 'trade', 'matchup', 'power', 'recap']);
+
+function seasonNeedAdvice() {
+  return Object.entries(ST.adv.season.pending)
+    .sort((a, b) => a[1].since - b[1].since)
+    .map(([kind, p]) => ({ kind, since: p.since, params: p.params || null, basedOn: seasonToken() }));
+}
+
+function seasonAdviceEvent(rec) {
+  return {
+    kind: rec.kind, seq: rec.seq, basedOn: rec.basedOn, phase: 'done',
+    stale: rec.basedOn !== seasonToken(),
+    text: rec.text, parsed: rec.parsed, adviceLine: rec.adviceLine,
+    external: true, completedAt: rec.completedAt,
+  };
+}
+
+function buildSeasonBriefing() {
+  const se = ST.season;
+  const L = se.league || {}; const s = L.settings || {}; const sc = L.scoring_settings || {};
+  const v = se.view;
+  const rp = (L.roster_positions || []).filter(x => x !== 'BN' && x !== 'IR' && x !== 'TAXI');
+  const myTeam = v && v.standings ? v.standings.find(t => t.mine) : null;
+  const scoring = sc.rec >= 1 ? 'full PPR' : sc.rec >= 0.5 ? 'half PPR' : 'standard';
+  return [
+    'You are the season-long analyst inside a fantasy football manager tool ("Season War Room"). The server computes every number (projections, blended values, optimal lineups, need profiles); you judge close calls and explain. Each request names its advice kind; answer ONLY in that kind\'s strict format.',
+    '',
+    '## League',
+    `${L.name || 'league'} — ${(se.rosters || []).length || s.num_teams || '?'} teams · Scoring: ${scoring}`,
+    `Starting lineup: ${rp.join(', ')}${rp.includes('K') ? '' : ' (NO kicker in this league)'}`,
+    `Waivers: ${s.waiver_type === 2 ? `FAAB $${s.waiver_budget}` : 'rolling priority (a claim burns your position)'} · Trade deadline: week ${s.trade_deadline || '?'} · Playoffs start: week ${s.playoff_week_start || '?'}`,
+    myTeam ? `My team: ${myTeam.name} (roster ${myTeam.roster_id}) — ${myTeam.wins}-${myTeam.losses}, ranked ${myTeam.rank} of ${v.standings.length}` : 'My team: (not yet selected)',
+    '',
+    '## How to read the numbers (all precomputed — trust them, do not recalculate)',
+    '- proj = this-week projected points in league scoring. ppg = actual season points per game.',
+    '- value = rest-of-season worth: preseason draft-board curve blended with season PPG (early season leans on the draft board — treat as approximate, and weigh recent role changes yourself). Scale: elite ≈ 90-100, solid starter ≈ 30-60, waiver fodder < 15.',
+    '- Optimal lineups are server-computed (greedy over projections with flex eligibility). Your judgment adds what numbers miss: matchups, injury risk, usage trends, game scripts.',
+    '- Injury statuses come from Sleeper and can lag; each request states data age. If a request is flagged DEGRADED (sparse projections), hedge accordingly and say so.',
+    '',
+    '## Hard rules',
+    '- Only reference players and teams listed in the request. Never invent players, stats, or news.',
+    '- Output format (STRICT — parsed by machine): first line `ADVICE: <one-line summary>`, then ONE fenced ```json block matching the kind\'s schema below, nothing after it.',
+    '',
+    '## JSON schema per kind',
+    'lineup: {"changes":[{"slot":"","start":"","sit":"","why":"<=20 words"}],"confirm_optimal":true|false,"watch":["player — what to check before kickoff"],"summary":"<=40 words"}',
+    'waiver: {"claims":[{"add":"","drop":"","worth_waiver_spot":true|false,"why":"<=25 words"}],"pass":["name"],"summary":"<=40 words"} — claims in priority order; worth_waiver_spot = worth burning my rolling-waiver position vs waiting for free agency.',
+    'trade eval: {"verdict":"accept|reject|counter","delta":"who wins and why, <=25 words","counter":"counter-offer suggestion or null","why":"<=40 words"}',
+    'trade scan: {"ideas":[{"team":"","give":["name"],"get":["name"],"why":"<=25 words"}],"summary":"<=40 words"}',
+    'matchup: {"projected":"me <pts> — opp <pts>","win_read":"favored|coin-flip|underdog + one clause","their_threats":["name — why"],"my_edges":["..."],"keys":["..."],"summary":"<=50 words"}',
+    'power: {"rankings":[{"rank":1,"team":"","comment":"<=15 words, punchy — trash talk welcome"}],"my_outlook":"<=40 words","summary":"<=30 words"}',
+    'recap: {"headline":"<=12 words","my_week":"<=40 words","bench_regret":"<=25 words or null","league_notes":["<=20 words each, 2-4 items"],"look_ahead":"<=30 words","summary":"<=30 words"} — Monday-morning tone, honest about my mistakes, trash talk welcome.',
+  ].join('\n');
+}
+
+function notesLines() {
+  const notes = Object.entries(ST.session.notes || {}).filter(([, v]) => v);
+  if (!notes.length) return [];
+  return ['', '## My notes on players', ...notes.map(([pid, note]) => `- ${(ST.players[pid] || {}).n || pid}: ${note}`)];
+}
+
+function fmtPlayerLine(p) {
+  const bits = [p.name, `${p.pos} ${p.team || 'FA'}`];
+  if (p.opp) bits.push('vs ' + p.opp);
+  if (p.proj != null) bits.push(`proj ${p.proj}`);
+  if (p.ppg != null) bits.push(`ppg ${p.ppg}`);
+  if (p.value != null) bits.push(`val ${p.value}`);
+  if (p.inj) bits.push(`[${p.inj}]`);
+  if (p.onBye) bits.push('[BYE/no game]');
+  return bits.join(' | ');
+}
+
+function promptHeader(kind) {
+  const v = ST.season.view;
+  return [
+    `# ${kind.toUpperCase()} advice request (kind=${kind}, basedOn=${seasonToken()})`,
+    `Week ${v.week} · projections: ${v.projCount} players${v.projDegraded ? ' — DEGRADED (sparse; hedge accordingly)' : ''} · player data age ${v.playersAgeH != null ? v.playersAgeH + 'h' : '?'}${v.degraded ? ' · Sleeper sync DEGRADED' : ''}`,
+    '',
+  ];
+}
+
+function buildLineupPrompt() {
+  const v = ST.season.view;
+  if (!v || !v.lineup) return null;
+  const L = v.lineup;
+  const lines = promptHeader('lineup');
+  lines.push('## Current starters (slot | player)');
+  for (const c of L.current) lines.push(`${c.slot}: ${c.empty ? '(EMPTY)' : fmtPlayerLine(c)}`);
+  lines.push('');
+  lines.push(`## Server-computed optimal (proj total ${L.optTotal} vs current ${L.curTotal}, gain ${L.gain})`);
+  for (const o of L.optimal) lines.push(`${o.slot}: ${o.empty ? '(none available)' : fmtPlayerLine(o)}`);
+  if (L.swapIn.length || L.swapOut.length) {
+    lines.push('');
+    lines.push('## Suggested swaps');
+    lines.push(`IN: ${L.swapIn.map(fmtPlayerLine).join(' ;; ') || '(none)'}`);
+    lines.push(`OUT: ${L.swapOut.map(fmtPlayerLine).join(' ;; ') || '(none)'}`);
+  }
+  if (L.flags.length) {
+    lines.push('');
+    lines.push('## Flags');
+    for (const f of L.flags) lines.push(`- ${f.name}${f.slot ? ` (${f.slot})` : ''}: ${f.reason}`);
+  }
+  if (L.closeCalls.length) {
+    lines.push('');
+    lines.push('## Close calls (the judgment calls — margins under 2.5 proj pts)');
+    for (const c of L.closeCalls) lines.push(`- bench ${fmtPlayerLine(c.bench)} vs starter ${fmtPlayerLine(c.starter)} (margin ${c.margin})`);
+  }
+  const bench = v.myRoster ? v.myRoster.players.filter(p => !p.starter) : [];
+  lines.push('');
+  lines.push('## Full bench');
+  for (const p of bench) lines.push('- ' + fmtPlayerLine(p));
+  if (v.matchup && v.matchup.opp) {
+    lines.push('');
+    lines.push(`## Matchup context: vs ${v.matchup.opp.name} (${v.matchup.opp.record}, proj ${v.matchup.opp.proj})`);
+  }
+  const locked = v.matchup && v.matchup.my && v.matchup.my.starters
+    ? v.matchup.my.starters.filter(s => s.gs === 'live' || s.gs === 'final') : [];
+  lines.push(...notesLines());
+  lines.push('');
+  if (locked.length) lines.push(`LOCKED (game live or final — cannot be swapped): ${locked.map(s => s.name).join(', ')}. Only advise changes among unlocked players.`);
+  else lines.push('No games have kicked off yet — every listed player is still swappable. Flag early-window players in "watch".');
+  lines.push('Give lineup advice now in the strict lineup format.');
+  return lines.join('\n');
+}
+
+function buildRecapPrompt() {
+  const v = ST.season.view;
+  if (!v || !v.recapWeek) return null;
+  const r = computeRecap(v.recapWeek);
+  if (!r || !r.my) return null;
+  const lines = promptHeader('recap');
+  lines.push(`## My week ${r.week}: ${r.my.won ? 'WIN' : 'LOSS'} ${r.my.points} — ${r.my.oppPoints} vs ${r.my.opp}`);
+  lines.push(`Optimal-with-hindsight lineup would have scored ${r.my.optimal} (points left on bench: ${r.my.benchRegret}). Hindsight lineup uses my current roster — close enough, note if it matters.`);
+  lines.push(`My top scorers: ${r.my.best.map(p => `${p.name} ${p.pts}${p.started ? '' : ' (BENCHED)'}`).join(', ')}`);
+  lines.push(`My worst starters: ${r.my.worst.map(p => `${p.name} ${p.pts}`).join(', ')}`);
+  lines.push('');
+  lines.push('## League results');
+  for (const res of r.results) lines.push(`- ${res.winner} ${res.wpts} def. ${res.loser} ${res.lpts}${res.mine ? ' [MY GAME]' : ''}`);
+  if (r.high) lines.push(`Week high: ${r.high.winner} ${r.high.wpts}. Week low: ${r.low.loser} ${r.low.lpts}.`);
+  lines.push('');
+  lines.push('## Standings now');
+  for (const t of v.standings) lines.push(`${t.rank}. ${t.name}${t.mine ? ' [ME]' : ''} ${t.wins}-${t.losses} (${t.fpts} PF${t.odds != null ? `, playoff odds ${t.odds}%` : ''})`);
+  const advised = (ST.adv.season.history || []).filter(h => h.week === r.week && h.adviceLine);
+  if (advised.length) {
+    lines.push('');
+    lines.push('## What I advised that week (grade yourself honestly)');
+    for (const h of advised) lines.push(`- [${h.kind}] ${h.adviceLine}`);
+  }
+  lines.push('');
+  lines.push('Write the Monday-morning recap now in the strict recap format.');
+  return lines.join('\n');
+}
+
+function buildWaiverPrompt() {
+  const v = ST.season.view;
+  if (!v || !v.waivers) return null;
+  const W = v.waivers;
+  const lines = promptHeader('waiver');
+  lines.push(`My rolling waiver position: ${W.myWaiverPos != null ? `${W.myWaiverPos} of ${v.standings.length}` : 'unknown'} (a successful claim sends me to the back of the line). Standing question per claim: worth burning that position, or wait and grab in free agency?`);
+  lines.push('');
+  lines.push('## My positional need profile (starter strength vs league median)');
+  for (const n of W.needProfile) lines.push(`- ${n.pos}: mine ${n.mine} vs median ${n.median} -> need ${n.need}`);
+  lines.push('');
+  lines.push('## Top free agents (name | pos team | this-wk proj | 24h adds | ROS value | season ppg | my need)');
+  for (const c of W.candidates) {
+    lines.push(`- ${c.name} | ${c.pos} ${c.team || 'FA'} | ${c.proj != null ? c.proj : '-'} | +${c.trend} | ${c.value} | ${c.ppg != null ? c.ppg : '-'} | ${c.need}${c.inj ? ` | [${c.inj}]` : ''}`);
+  }
+  lines.push('');
+  lines.push('## My droppable bench (lowest ROS value first)');
+  for (const d of W.drops) lines.push('- ' + fmtPlayerLine(d));
+  const txs = (v.transactions || []).filter(t => t.status === 'complete').slice(0, 8);
+  if (txs.length) {
+    lines.push('');
+    lines.push('## Recent league moves (context on what managers are chasing)');
+    for (const t of txs) {
+      const bits = [...t.adds.map(a => `${a.to} added ${a.name} (${a.pos})`), ...t.drops.map(d => `${d.from} dropped ${d.name}`)];
+      if (bits.length) lines.push('- ' + bits.join('; '));
+    }
+  }
+  lines.push(...notesLines());
+  lines.push('');
+  lines.push('Give waiver advice now in the strict waiver format (claims in priority order; be honest when the right move is to pass).');
+  return lines.join('\n');
+}
+
+function buildTradePrompt(params) {
+  const v = ST.season.view;
+  if (!v) return null;
+  const lines = promptHeader('trade');
+  if (params && params.mode === 'scan') {
+    const scan = computeTradeScan();
+    const nameOf = (rid) => { const t = v.standings.find(x => x.roster_id === rid); return t ? t.name : 'roster ' + rid; };
+    lines.push('## League surplus/deficit matrix (players above replacement value minus starters needed; + = tradeable surplus, − = hole)');
+    for (const m of scan.matrix) {
+      lines.push(`- ${nameOf(m.roster_id)}${m.mine ? ' [ME]' : ''}: ${Object.entries(m.surplus).map(([p, s]) => `${p} ${s > 0 ? '+' : ''}${s}`).join(', ')}`);
+    }
+    lines.push('');
+    lines.push(`## Most complementary partners for me: ${scan.partners.map(p => `${nameOf(p.roster_id)} (fit ${p.complement})`).join(', ') || '(none stand out)'}`);
+    lines.push('');
+    lines.push('## Rosters of the top partners (name | value), best first');
+    for (const p of scan.partners) {
+      const r = v.rosters.find(x => x.roster_id === p.roster_id);
+      if (r) lines.push(`- ${r.name}: ${r.players.slice(0, 12).map(x => `${x.name} (${x.pos} ${x.value})`).join(', ')}`);
+    }
+    const mine = v.rosters.find(r => r.mine);
+    if (mine) lines.push(`- MY ROSTER: ${mine.players.map(x => `${x.name} (${x.pos} ${x.value})`).join(', ')}`);
+    lines.push('');
+    lines.push(`Trade deadline: week ${v.tradeDeadline || '?'} (current week ${v.week}).`);
+    lines.push('Suggest 2-3 realistic trade ideas now in the strict trade-scan format.');
+    return lines.join('\n');
+  }
+  const ev = computeTradeEval(params || {});
+  if (ev.error) return null;
+  const partnerTeam = v.standings.find(t => t.roster_id === ev.partner.roster_id);
+  lines.push(`## Proposed trade with ${partnerTeam ? partnerTeam.name : 'roster ' + ev.partner.roster_id}${partnerTeam ? ` (${partnerTeam.wins}-${partnerTeam.losses}, rank ${partnerTeam.rank})` : ''}`);
+  lines.push(`I GIVE (total value ${ev.giveValue}):`);
+  for (const p of ev.give) lines.push('- ' + fmtPlayerLine(p));
+  lines.push(`I GET (total value ${ev.getValue}):`);
+  for (const p of ev.get) lines.push('- ' + fmtPlayerLine(p));
+  lines.push('');
+  lines.push('## Server-computed weekly lineup impact (optimal-lineup proj totals)');
+  lines.push(`- My lineup: ${ev.myLineup.before} -> ${ev.myLineup.after} (${ev.myLineup.delta >= 0 ? '+' : ''}${ev.myLineup.delta})`);
+  lines.push(`- Their lineup: ${ev.theirLineup.before} -> ${ev.theirLineup.after} (${ev.theirLineup.delta >= 0 ? '+' : ''}${ev.theirLineup.delta})`);
+  lines.push(`- My bench depth after: ${Object.entries(ev.myDepthAfter).map(([p, n]) => `${p}x${n}`).join(', ') || 'none'}`);
+  const mine = v.rosters.find(r => r.mine);
+  const theirs = v.rosters.find(r => r.roster_id === ev.partner.roster_id);
+  if (mine) lines.push(`\n## My full roster: ${mine.players.map(x => `${x.name} (${x.pos} ${x.value})`).join(', ')}`);
+  if (theirs) lines.push(`## Their full roster: ${theirs.players.map(x => `${x.name} (${x.pos} ${x.value})`).join(', ')}`);
+  if (ev.deadlinePassed) lines.push('\nWARNING: the trade deadline has passed — this can only be advisory.');
+  lines.push(...notesLines());
+  lines.push('');
+  lines.push('Judge this trade now in the strict trade-eval format.');
+  return lines.join('\n');
+}
+
+function buildMatchupPrompt() {
+  const v = ST.season.view;
+  if (!v || !v.matchup || !v.matchup.opp) return null;
+  const se = ST.season;
+  const m = v.matchup;
+  const lines = promptHeader('matchup');
+  const me = v.standings.find(t => t.mine);
+  lines.push(`## Week ${m.week}: ${me ? me.name : 'me'} (${m.my.record}, rank ${m.my.rank}, power ${m.my.power}) vs ${m.opp.name} (${m.opp.record}, rank ${m.opp.rank}, power ${m.opp.power})`);
+  lines.push(`Projected starter totals: me ${m.my.proj} (optimal ${m.my.optProj}) — them ${m.opp.proj} (optimal ${m.opp.optProj})`);
+  lines.push('');
+  const values = buildValueIndex();
+  const rp = se.league.roster_positions || [];
+  const oppR = se.rosters.find(r => r.roster_id === m.opp.roster_id);
+  if (v.lineup) {
+    lines.push('## My current starters');
+    for (const c of v.lineup.current) lines.push(`${c.slot}: ${c.empty ? '(EMPTY)' : fmtPlayerLine(c)}`);
+    lines.push('');
+  }
+  if (oppR) {
+    const oppLineup = computeLineup(oppR, rp, values);
+    lines.push('## Their current starters');
+    for (const c of oppLineup.current) lines.push(`${c.slot}: ${c.empty ? '(EMPTY)' : fmtPlayerLine(c)}`);
+    if (oppLineup.flags.length) {
+      lines.push('Their flags: ' + oppLineup.flags.map(f => `${f.name} (${f.reason})`).join('; '));
+    }
+    lines.push('');
+  }
+  lines.push('Write the scouting report now in the strict matchup format.');
+  return lines.join('\n');
+}
+
+function buildPowerPrompt() {
+  const v = ST.season.view;
+  if (!v) return null;
+  const lines = promptHeader('power');
+  lines.push('## Standings + server-computed power score (win% 30, points-for 15, projected lineup strength 30, roster value 25)');
+  lines.push('rank | team | W-L | PF | this-wk proj (optimal) | roster value | POWER');
+  for (const t of v.standings) {
+    lines.push(`${t.rank} | ${t.name}${t.mine ? ' [ME]' : ''} | ${t.wins}-${t.losses}${t.ties ? '-' + t.ties : ''} | ${t.fpts} | ${t.curProj} (${t.optProj}) | ${t.value} | ${t.power}`);
+  }
+  lines.push('');
+  lines.push('## Each roster\'s top players (name pos value)');
+  for (const r of v.rosters) {
+    lines.push(`- ${r.name}${r.mine ? ' [ME]' : ''}: ${r.players.slice(0, 6).map(x => `${x.name} ${x.pos} ${x.value}`).join(', ')}`);
+  }
+  lines.push('');
+  lines.push('Rank all teams 1-N with punchy comments now in the strict power format (order by YOUR judgment, not just the power score — explain where you diverge).');
+  return lines.join('\n');
+}
+
+function buildSeasonPrompt(kind, params) {
+  if (!ST.season.view) return null;
+  switch (kind) {
+    case 'lineup': return buildLineupPrompt();
+    case 'waiver': return buildWaiverPrompt();
+    case 'trade': return buildTradePrompt(params);
+    case 'matchup': return buildMatchupPrompt();
+    case 'power': return buildPowerPrompt();
+    case 'recap': return buildRecapPrompt();
+    default: return null;
+  }
+}
+
 // -------------------------------------- 10. SSE hub + HTTP server / routes
 
 function sseWrite(res, event, data) {
@@ -1056,14 +2343,18 @@ function broadcast(event, data) {
 setInterval(() => broadcast('ping', { t: Date.now() }), 15000).unref();
 
 function snapshot() {
+  const seasonAdvice = {};
+  for (const [kind, rec] of Object.entries(ST.adv.season.latest)) seasonAdvice[kind] = seasonAdviceEvent(rec);
   return {
     board: ST.board,
-    session: { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes },
+    session: { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes, league_id: ST.session.league_id, my_roster_id: ST.session.my_roster_id },
     rankingsMeta: ST.rankingsMeta,
     rankings: ST.rankings,
     advice: ST.adv.latest ? adviceEvent(ST.adv.latest) : null,
     adviceInflight: ST.adv.inflight ? { seq: ST.adv.inflight.seq, basedOn: ST.adv.inflight.basedOn, buffer: ST.adv.inflight.buffer, pickLine: ST.adv.inflight.pickLine } : null,
     status: pollStatus(),
+    season: ST.season.view,
+    seasonAdvice,
   };
 }
 
@@ -1155,7 +2446,7 @@ const server = http.createServer(async (req, res) => {
       ST.session.my_slot = Number(body.my_slot) || null;
       saveJson('session.json', ST.session);
       ST.draft = { meta, picks: [], anomalies: [], status: meta.status };
-      ST.adv.latest = null; ST.adv.prevOnClock = false; if (ST.adv.inflight) abortInflight('draft-changed');
+      ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.extForce = false; ST.adv.extNeedSince = null; if (ST.adv.inflight) abortInflight('draft-changed');
       computeVorp(); rebuildStaticPrefix(); computeBoard();
       prewarmCache();                       // fire-and-forget
       startPolling();
@@ -1195,25 +2486,234 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (p === '/api/advise/refresh' && req.method === 'POST') {
+      if (ADVISOR === 'external') {
+        // keep the last rec on screen (shown with an "updating" spinner) while
+        // the external advisor redoes it — blanking the panel mid-draft is worse
+        ST.adv.extForce = true;                 // watcher fires even outside the window
+        ST.adv.extNeedSince = Date.now();
+        if (ST.board) advisorOnBoardChange();
+        return json(res, 200, { ok: true, external: true });
+      }
       if (ST.adv.inflight) abortInflight('manual-refresh');
       ST.adv.latest = null;
       if (ST.board) startAdvice(ST.board);
       return json(res, 200, { ok: true });
     }
 
+    // ---- external advisor (Claude Code session or manual paste) ----
+    if (p === '/api/advisor/context') {
+      const b = ST.board;
+      const out = {
+        advisor: ADVISOR,
+        needAdvice: externalNeedAdvice(),
+        status: b ? b.status : (ST.draft.status || null),
+        draftId: ST.session.draft_id, mySlot: ST.session.my_slot,
+        rankingsLoaded: ST.rankings.length,
+        pickCount: b ? b.pickCount : null,
+        currentPickNo: b ? b.currentPickNo : null,
+        currentRound: b ? b.currentRound : null,
+        picksUntilMine: b ? b.picksUntilMine : null,
+        onClock: b ? b.onClock : false,
+        myNextPickNo: b ? b.myNextPickNo : null,
+        latestBasedOn: ST.adv.latest ? ST.adv.latest.basedOn : null,
+        degraded: ST.poll.degraded,
+      };
+      // in-season block: pending questions for the season watcher (draft fields above are untouched)
+      out.season = {
+        connected: !!ST.session.league_id && !!ST.season.view,
+        week: ST.season.nfl.week, token: seasonToken(),
+        pending: seasonNeedAdvice(),
+      };
+      const kind = url.searchParams.get('kind');
+      if (kind && SEASON_KINDS.has(kind)) {
+        const pending = ST.adv.season.pending[kind];
+        out.kind = kind;
+        out.basedOn = seasonToken();
+        out.params = pending ? pending.params || null : null;
+        if (!out.params && url.searchParams.get('params')) {   // 📋 copy without a queued ask
+          try { out.params = JSON.parse(url.searchParams.get('params')); } catch { /* ignore */ }
+        }
+        if (url.searchParams.get('prompt') === '1') out.prompt = buildSeasonPrompt(kind, out.params);
+        if (url.searchParams.get('full') === '1') out.briefing = buildSeasonBriefing();
+        return json(res, 200, out);
+      }
+      if (url.searchParams.get('prompt') === '1' && b && ST.rankings.length) out.prompt = buildDynamicMessage(b);
+      if (url.searchParams.get('full') === '1') {
+        if (!ST.staticPrefix) rebuildStaticPrefix();
+        out.briefing = ST.staticPrefix;
+      }
+      return json(res, 200, out);
+    }
+
+    if (p === '/api/advisor/submit' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req));
+      const text = String(body.text || '');
+      if (!text.trim()) return json(res, 400, { error: 'text required' });
+      // season kinds take their own path; absent/draft kind falls through to the draft path unchanged
+      if (body.kind && SEASON_KINDS.has(body.kind)) {
+        const kind = body.kind;
+        const parsed = parseAdviceJson(text);
+        const am = text.match(/ADVICE:\s*([^\n]+)/);
+        const adviceLine = am ? am[1].trim() : null;
+        if (!parsed && !adviceLine) return json(res, 400, { error: 'unrecognized format — need an "ADVICE: <summary>" line and/or the ```json block' });
+        const basedOn = body.basedOn != null ? String(body.basedOn) : seasonToken();
+        const seq = ++ST.adv.seq;
+        const pending = ST.adv.season.pending[kind];
+        const startedAt = pending ? pending.since : Date.now();
+        const rec = { kind, seq, basedOn, text, parsed, adviceLine, external: true, completedAt: Date.now() };
+        ST.adv.season.latest[kind] = rec;
+        delete ST.adv.season.pending[kind];
+        ST.adv.season.history.push({ kind, week: seasonWeek(), adviceLine, at: Date.now() });
+        if (ST.adv.season.history.length > 120) ST.adv.season.history.splice(0, ST.adv.season.history.length - 120);
+        saveJson('season-advice.json', { latest: ST.adv.season.latest, history: ST.adv.season.history });
+        ST.adv.latency.push({ seq, basedOn, startedAt, ttfe: null, ttft: null, total: Date.now() - startedAt, aborted: null, error: null, cacheRead: null, cacheWrite: null, inputTokens: null, outputTokens: null, mock: false, external: true, kind });
+        if (ST.adv.latency.length > 300) ST.adv.latency.splice(0, ST.adv.latency.length - 300);
+        if (ST.season.view) { ST.season.view.advicePending = Object.keys(ST.adv.season.pending); broadcast('season', ST.season.view); }
+        broadcast('season_advice', { kind, rec: seasonAdviceEvent(rec) });
+        log(`season advice #${seq} submitted (kind=${kind}, basedOn=${basedOn}, now=${seasonToken()})`);
+        return json(res, 200, { ok: true, seq, kind, basedOn, stale: basedOn !== seasonToken(), pending: seasonNeedAdvice().map(x => x.kind) });
+      }
+      const parsed = parseAdviceJson(text);
+      const pm = text.match(/PICK:\s*([^\n]+)/);
+      const pickLine = pm ? pm[1].trim() : null;
+      if (!parsed && !pickLine) return json(res, 400, { error: 'unrecognized format — need a "PICK: Name (POS, TEAM)" line and/or the ```json block' });
+      const b = ST.board;
+      const basedOn = Number.isFinite(Number(body.basedOn)) ? Number(body.basedOn) : (b ? b.pickCount : 0);
+      const seq = ++ST.adv.seq;
+      const startedAt = ST.adv.extNeedSince || Date.now();
+      const rec = {
+        seq, basedOn, text, parsed, pickLine, external: true, completedAt: Date.now(),
+        timings: { ttft: null, total: Date.now() - startedAt, cacheRead: null },
+      };
+      ST.adv.latest = rec;
+      ST.adv.extNeedSince = null;
+      ST.adv.extForce = false;
+      ST.adv.latency.push({ seq, basedOn, startedAt, ttfe: null, ttft: null, total: rec.timings.total, aborted: null, error: null, cacheRead: null, cacheWrite: null, inputTokens: null, outputTokens: null, mock: false, external: true, speculative: !(b && b.onClock) });
+      if (ST.adv.latency.length > 300) ST.adv.latency.splice(0, ST.adv.latency.length - 300);
+      broadcast('advice', adviceEvent(rec));
+      if (b && b.onClock) markVisible('external-submitted');
+      log(`external advice #${seq} submitted (basedOn=${basedOn}${b ? `, board at ${b.pickCount}` : ''})`);
+      return json(res, 200, { ok: true, seq, pickCount: b ? b.pickCount : null, stale: !!(b && basedOn < b.pickCount), needAdvice: externalNeedAdvice() });
+    }
+
     if (p === '/api/reset' && req.method === 'POST') {
-      ST.session = { draft_id: null, my_slot: null, manual: {}, notes: {} };
+      // draft reset must NOT disconnect the league — league fields carry over
+      ST.session = {
+        draft_id: null, my_slot: null, manual: {}, notes: {},
+        league_id: ST.session.league_id, my_roster_id: ST.session.my_roster_id, my_user_id: ST.session.my_user_id,
+      };
       saveJson('session.json', ST.session);
       ST.draft = { meta: null, picks: [], anomalies: [], status: null };
-      ST.board = null; ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.turn = null;
+      ST.board = null; ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.turn = null; ST.adv.extForce = false; ST.adv.extNeedSince = null;
       if (ST.adv.inflight) abortInflight('reset');
       clearTimeout(ST.poll.timer); ST.poll.running = false; ST.poll.failures = 0; ST.poll.degraded = false;
       broadcast('board', null); broadcast('status', pollStatus());
       return json(res, 200, { ok: true });
     }
 
+    // ---- season routes ----
+    if (p === '/api/league' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req));
+      const leagueId = String(body.league_id || '').trim();
+      if (!/^\d{5,25}$/.test(leagueId)) return json(res, 400, { error: 'league_id must be the numeric Sleeper league id' });
+      let league, users, rosters;
+      try {
+        [league, users, rosters] = await Promise.all([
+          fetchJson(`${SLEEPER_REAL}/league/${leagueId}`, {}, 10000),
+          fetchJson(`${SLEEPER_REAL}/league/${leagueId}/users`, {}, 10000),
+          fetchJson(`${SLEEPER_REAL}/league/${leagueId}/rosters`, {}, 10000),
+        ]);
+      } catch (e) { return json(res, 502, { error: `could not fetch league: ${e.message}` }); }
+      // validated: commit
+      ST.session.league_id = leagueId;
+      saveJson('session.json', ST.session);
+      const se = ST.season;
+      se.league = league; se.users = users; se.rosters = rosters;
+      se.poll.tick = 0; se.sig = {};    // force full refetch tiers on next poll
+      const userById = new Map(users.map(u => [u.user_id, u]));
+      const teams = rosters.map(r => {
+        const u = userById.get(r.owner_id);
+        return { roster_id: r.roster_id, name: (u && ((u.metadata && u.metadata.team_name) || u.display_name)) || `Roster ${r.roster_id}`, owner: u ? u.display_name : null };
+      });
+      // guess my roster from the completed draft's slot->roster mapping if available
+      let guess = null;
+      const dm = ST.draft.meta;
+      if (dm && dm.league_id === leagueId && dm.slot_to_roster_id && ST.session.my_slot) {
+        guess = dm.slot_to_roster_id[ST.session.my_slot] || null;
+      }
+      computeSeason();
+      startSeasonPolling();
+      broadcast('season', se.view);
+      return json(res, 200, { ok: true, name: league.name, teams, guess, week: se.nfl.week });
+    }
+
+    if (p === '/api/league/me' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req));
+      const rid = Number(body.roster_id) || null;
+      ST.session.my_roster_id = rid;
+      const r = rid ? ST.season.rosters.find(x => x.roster_id === rid) : null;
+      ST.session.my_user_id = r ? r.owner_id : null;
+      saveJson('session.json', ST.session);
+      computeSeason();
+      broadcast('season', ST.season.view);
+      return json(res, 200, { ok: true });
+    }
+
+    if (p === '/api/season') return json(res, 200, ST.season.view || { error: 'no league connected' });
+
+    if (p === '/api/season/refresh' && req.method === 'POST') {
+      if (!ST.session.league_id) return json(res, 400, { error: 'no league connected' });
+      if (SEASON_FIXTURE) { computeSeason(); broadcast('season', ST.season.view); return json(res, 200, { ok: true, fixture: true }); }
+      clearTimeout(ST.season.poll.timer);
+      seasonPollOnce(true).catch(e => warn('forced season poll failed:', e.message));
+      return json(res, 200, { ok: true });
+    }
+
+    if (p === '/api/season/reset' && req.method === 'POST') {
+      ST.session.league_id = null; ST.session.my_roster_id = null; ST.session.my_user_id = null;
+      saveJson('session.json', ST.session);
+      clearTimeout(ST.season.poll.timer); ST.season.poll.running = false; ST.season.poll.failures = 0; ST.season.poll.degraded = false;
+      ST.season.league = null; ST.season.users = []; ST.season.rosters = []; ST.season.matchups = null;
+      ST.season.transactions = []; ST.season.view = null; ST.season.sig = {};
+      ST.adv.season.pending = {};
+      broadcast('season', null);
+      return json(res, 200, { ok: true });
+    }
+
+    if (p === '/api/season/ask' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req));
+      const kind = String(body.kind || '');
+      if (!SEASON_KINDS.has(kind)) return json(res, 400, { error: `kind must be one of: ${[...SEASON_KINDS].join(', ')}` });
+      if (!ST.season.view) return json(res, 400, { error: 'no league connected' });
+      if (kind === 'trade' && body.params && body.params.mode !== 'scan') {
+        const ev = computeTradeEval(body.params || {});
+        if (ev.error) return json(res, 400, { error: ev.error });
+      }
+      ST.adv.season.pending[kind] = { since: Date.now(), params: body.params || null };
+      ST.season.view.advicePending = Object.keys(ST.adv.season.pending);
+      broadcast('season', ST.season.view);
+      broadcast('season_advice', { kind, phase: 'pending', basedOn: seasonToken() });
+      log(`season advice requested: ${kind}${body.params ? ' ' + JSON.stringify(body.params).slice(0, 120) : ''}`);
+      return json(res, 200, { ok: true, kind, basedOn: seasonToken(), pending: Object.keys(ST.adv.season.pending) });
+    }
+
+    if (p === '/api/season/alerts/clear' && req.method === 'POST') {
+      ST.season.alerts = [];
+      saveSeason();
+      if (ST.season.view) { ST.season.view.alerts = []; broadcast('season', ST.season.view); }
+      return json(res, 200, { ok: true });
+    }
+
+    if (p === '/api/season/trade/eval' && req.method === 'POST') {
+      const body = JSON.parse(await readBody(req));
+      if (!ST.season.view) return json(res, 400, { error: 'no league connected' });
+      const ev = computeTradeEval(body || {});
+      if (ev.error) return json(res, 400, { error: ev.error });
+      return json(res, 200, ev);
+    }
+
     // debug endpoints — replay/test mode only
-    if (p.startsWith('/api/debug/') && (REPLAY || MOCK_LLM)) {
+    if (p.startsWith('/api/debug/') && (REPLAY || MOCK_LLM || SEASON_FIXTURE)) {
       if (p === '/api/debug/kill-llm' && req.method === 'POST') {
         const body = JSON.parse(await readBody(req));
         ST.adv.killLLM = !!body.on;
@@ -1225,6 +2725,10 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { rss: process.memoryUsage().rss, heapUsed: process.memoryUsage().heapUsed, sseClients: ST.sse.size, uptime: process.uptime() });
       }
       if (p === '/api/debug/prompt') {
+        const kind = url.searchParams.get('kind');
+        if (kind && SEASON_KINDS.has(kind)) {
+          return json(res, 200, { briefing: buildSeasonBriefing(), prompt: buildSeasonPrompt(kind, kind === 'trade' && url.searchParams.get('mode') === 'scan' ? { mode: 'scan' } : null) });
+        }
         return json(res, 200, { staticPrefix: ST.staticPrefix, dynamic: ST.board ? buildDynamicMessage(ST.board) : null });
       }
     }
@@ -1238,7 +2742,15 @@ const server = http.createServer(async (req, res) => {
 
 // Pure functions exported for tools/selftest.js; requiring this file does not
 // start the server unless it is the entry point.
-module.exports = { normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST, resolvePlayer, buildNameIndex, COL_PATTERNS };
+module.exports = {
+  normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST,
+  resolvePlayer, buildNameIndex, COL_PATTERNS, externalNeedAdvice, parseAdviceJson, ADVISOR,
+  // season pure math (selftest + tools)
+  optimalLineup, projPoints, parseStatRows, buildValueIndex, lineupInfo, computeLineup,
+  computeWaivers, computeNeedProfile, computeTradeEval, computeTradeScan, computeSeason,
+  seasonNeedAdvice, seasonToken, startersNeeded, leaguePositions, SEASON_KINDS,
+  computePlayoffOdds, computeByePlan, computeRecap, checkInjuryAlerts,
+};
 if (require.main !== module) return;
 
 process.on('uncaughtException', (e) => { warn('uncaughtException:', e.stack || e.message); });
@@ -1247,12 +2759,21 @@ process.on('unhandledRejection', (e) => { warn('unhandledRejection:', e && (e.st
 (async () => {
   await loadPlayers();
   loadRankingsFromDisk();
+  const savedAdvice = loadJson('season-advice.json', null);
+  if (savedAdvice && savedAdvice.latest) ST.adv.season.latest = savedAdvice.latest;
+  if (savedAdvice && Array.isArray(savedAdvice.history)) ST.adv.season.history = savedAdvice.history;
+  loadSeasonFromDisk();
   server.listen(PORT, () => {
-    log(`Draft War Room on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''} effort=${EFFORT}`);
-    if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) warn('ANTHROPIC_API_KEY is not set — advisor disabled, fallback board only');
+    log(`Draft War Room on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''}${SEASON_FIXTURE ? ' [SEASON_FIXTURE]' : ''} effort=${EFFORT}`);
+    if (ADVISOR === 'external') log('EXTERNAL ADVISOR mode — advice comes from a Claude session (tools/advisor-watch.js wakes it; POST /api/advisor/submit delivers; 📋 in the UI copies the prompt for manual paste)');
+    else if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) warn('ANTHROPIC_API_KEY is not set — advisor disabled, fallback board only');
     if (ST.session.draft_id) {
       log(`resuming draft ${ST.session.draft_id} (slot ${ST.session.my_slot}) from session.json`);
       startPolling();
+    }
+    if (ST.session.league_id && !SEASON_FIXTURE) {
+      log(`resuming league ${ST.session.league_id} (roster ${ST.session.my_roster_id || '?'}) from session.json`);
+      startSeasonPolling();
     }
   });
 })();

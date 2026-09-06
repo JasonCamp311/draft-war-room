@@ -1,29 +1,73 @@
 # Draft War Room
 
-Live Sleeper draft tracker with claude-fable-5 pick recommendations — extended
-thinking on every call, streamed, prompt-cached, and speculatively precomputed so
-advice is on screen within ~0–5 s of your pick starting.
+Live Sleeper draft tracker with Claude pick recommendations. Two advisor modes:
+
+- **Claude Code mode (default, no API key)** — a Claude Code session running in
+  this folder is the advisor. A background watcher wakes it when you're within
+  2 picks of the clock; it reads the precomputed board and submits a
+  recommendation that renders in the UI. The 📋 button copies the full prompt
+  for manual paste into any Claude chat as a backup path.
+- **API mode** — set `ANTHROPIC_API_KEY` and claude-fable-5 is called directly
+  (extended thinking, streamed, prompt-cached, speculatively precomputed).
 
 Zero-dependency Node server (`server.js`) + single-file vanilla-JS frontend
 (`public/index.html`). No npm install, no build step.
 
 ---
 
-## Draft-day runbook (Saturday)
+## Running your own copy
 
-Open PowerShell in this folder (`cd C:\Users\jason\draft-war-room`).
+Requirements: [Node.js](https://nodejs.org) 18 or newer and a Sleeper league.
+Nothing else — no npm install, no accounts, no keys (unless you want API mode).
 
 ```powershell
-# 1. Set the key (session-scoped; do this in the same window that runs the server)
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-
-# 2. Start the server
+git clone https://github.com/JasonCamp311/draft-war-room.git
+cd draft-war-room
 node server.js
-# -> "Draft War Room on http://localhost:8484"
+# -> open http://localhost:8484
+```
+
+Then, in the UI:
+
+- **Draft night**: Import your rankings CSV, paste the Sleeper **draft ID**
+  (from `sleeper.com/draft/nfl/<ID>`), pick your slot, Connect.
+- **In-season**: on the Dashboard tab paste your Sleeper **league ID** (from
+  `sleeper.com/leagues/<ID>`) and pick your team.
+
+Pick how you want the advice generated:
+
+| Mode | How | Cost |
+|---|---|---|
+| **Claude Code** (default) | Open a Claude Code session in this folder and say *"run the advisor loop"* (draft) or *"help with my lineup"* (season). It reads `CLAUDE.md` and drives the watcher/submit tools. | Your Claude subscription |
+| **API** | Set `ANTHROPIC_API_KEY` before `node server.js`. The server calls claude-fable-5 directly. | Pay per token |
+| **None** | Just run the server. The deterministic fallback board, lineup optimizer, waiver ranking and trade evaluator all work without any model. The 📋 button copies the full prompt to paste into any chat. | Free |
+
+Everything the app stores lives in `data/` (gitignored): player cache, your
+rankings, league/draft connection, notes, advice history. Delete it for a
+factory reset. Sleeper's API is read-only, so nothing here can change your
+league — lineup and waiver moves are still made in the Sleeper app.
+
+---
+
+## Draft-day runbook (Claude Code mode)
+
+```powershell
+# 1. Start the server (PowerShell, in this folder). No key needed.
+cd draft-war-room
+node server.js
+# -> "Draft War Room on http://localhost:8484 ... EXTERNAL ADVISOR mode"
 # First start of the day fetches the Sleeper players DB (~5 MB, cached 24 h in data/).
 
-# 3. Open http://localhost:8484 in your browser
+# 2. Open http://localhost:8484 in your browser
 ```
+
+3. In a **Claude Code session in this folder**, say: *"the draft is starting —
+   run the advisor loop"*. Claude starts `tools/advisor-watch.js` in the
+   background; each time advice is wanted it wakes, reads the board context, and
+   submits a recommendation (`tools/advisor-submit.js`) that appears in the UI
+   tagged **CLAUDE**. It re-arms the watcher after every submission.
+4. If the Claude session ever wedges: hit 📋 in the UI, paste into claude.ai,
+   and read the answer there — or just draft off the always-live fallback board.
 
 In the UI:
 1. **Import CSV** — your rankings file. The import toast reports
@@ -46,24 +90,21 @@ During the draft:
   rows). The status dot top-left blinks red while Sleeper is erroring; state is
   kept and it recovers by itself.
 
-### Pre-draft checklist (do this Friday)
+### Pre-draft checklist
 
-- [ ] `$env:ANTHROPIC_API_KEY` set and valid (`node server.js` must NOT print
-      "ANTHROPIC_API_KEY is not set").
 - [ ] Rankings CSV is fresh, and a test import shows **0 unmatched** (or you know
       why each unmatched row is fine). Header must include a player-name column;
       recognized columns: RK/RANK, TIER(S), PLAYER NAME, TEAM, POS, BYE, PROJ/FPTS, NOTES.
-- [ ] One replay passed with the REAL API (not mock) to confirm key + latency:
-      see "Replay harness" below — run it once with the key set and `MOCK_LLM` NOT set,
-      and check `http://localhost:8484/api/latency` p50 ttft.
+- [ ] One replay passed in Claude Code mode: replay harness below + a Claude Code
+      session running the advisor loop; confirm recs appear in the UI tagged CLAUDE.
 - [ ] Quick browser pass: open the UI during that replay, watch one of your turns
       render, reload the page mid-draft, confirm everything comes back.
 - [ ] Sleeper mock drafts work the same way as league drafts — join one and point
       the app at its draft ID for a fully live end-to-end test if you want.
-- [ ] Delete `data/session.json` (or use a Reset via `POST /api/reset`) if you
-      tested against a different draft, so the app doesn't resume the test draft.
-      Importing your real CSV again right before the draft is fine and re-warms
-      the prompt cache.
+- [ ] Reset via `POST /api/reset` (or delete `data/session.json`) after testing
+      against a different draft, so the app doesn't resume the test draft.
+- [ ] (API mode only) `$env:ANTHROPIC_API_KEY` set + one real-API replay,
+      checking `http://localhost:8484/api/latency` p50 ttft.
 
 ---
 
@@ -95,17 +136,102 @@ Replay controls: `POST 127.0.0.1:3999/control/fail {"seconds":30}` (Sleeper 500s
 Debug (replay/mock only): `POST /api/debug/kill-llm {"on":true}`, `GET /api/debug/stats`,
 `GET /api/debug/prompt`.
 
+## External advisor protocol (Claude Code mode)
+
+The server never calls Anthropic in this mode; it exposes the same precomputed
+context the API prompt would get, and accepts finished advice:
+
+- `GET /api/advisor/context` — cheap poll: `{needAdvice, pickCount, picksUntilMine,
+  onClock, latestBasedOn, status, ...}`. Add `?prompt=1` for the dynamic board
+  message, `?full=1` for the static briefing (strategy + league + full rankings —
+  read it once per draft, it only changes on re-import).
+- `POST /api/advisor/submit` `{basedOn, text}` — text in the strict format
+  (`PICK:` line + ```json block). Response `stale:true` means the board moved
+  mid-advice: fetch fresh context and submit again.
+- `tools/advisor-watch.js` — polls context, prints it (with prompt) and exits
+  when `needAdvice` flips true, when the draft completes, or after 45 s of server
+  unreachability (exit 2). Designed to run via a background shell so the exit
+  wakes the Claude session.
+- `tools/advisor-submit.js --based-on N --file advice.txt` — submit helper.
+- `needAdvice` = within `SPECULATE_WITHIN` picks of your turn with no rec for the
+  current board, or ↻ was pressed (forces even outside the window).
+
+The advisor loop a Claude session runs: background-start the watcher → on wake,
+write advice from the printed prompt → submit → restart watcher. If a submission
+comes back `stale:true`, immediately refetch `?prompt=1` and submit again.
+
+## Season mode (in-season helper)
+
+Connect the league once on the **Dashboard** tab (league ID + pick your team —
+auto-guessed from the draft). The server then polls Sleeper league data on its own
+loop (rosters/matchups/transactions every 60 s; trending + weekly projections
+~5 min; NFL state/league/users + players-cache refresh ~30 min) and computes
+everything the tabs show:
+
+- **Dashboard** — my roster (projections, season PPG, blended ROS value, injury
+  badges), this week's matchup, standings with power scores + **playoff odds**
+  (Monte Carlo over the remaining league schedule), transaction feed, a
+  **bye-week planner** (chips per week, ⚠ on 3+ crunches), and a **player
+  alerts** strip (my players' injury-status changes + league-wide trending
+  drops). 🔮 Preview = matchup scouting report; 📊 Power = league power
+  rankings; 📰 Recap = Monday-morning week-in-review (enabled once a week has
+  completed; includes bench-regret math and grades my own prior advice).
+  During games the matchup panel becomes a **live scoreboard**: per-starter
+  points for both sides colored by game state, "yet to play" counts (game
+  statuses from the NFL schedule feed; polling tightens to every 60s while any
+  game is live). Double-click a roster player to attach a note — notes ride
+  into the waiver/trade/lineup prompts.
+- **Lineup** — current vs server-computed optimal (flex-aware greedy over
+  projections; hard-out players excluded), swap suggestions with point gains,
+  flags (Out/bye/empty slots), close calls. 🧠 asks Claude to judge them.
+- **Waivers** — free-agent pool ranked by a stated composite (ROS value +
+  this-week proj + 24 h trending adds + my positional need vs league median),
+  droppable bench, my rolling-waiver position.
+- **Trade** — build a trade (my players vs a partner's), **Evaluate** shows value
+  totals + before/after optimal-lineup deltas for BOTH teams; 🧠 has Claude
+  judge it; 🔎 scans all 12 rosters for complementary partners and trade ideas.
+
+**Season advisor protocol** (same external model as the draft): every "Ask
+Claude"/🔮/📊/🔎 button queues a question (`POST /api/season/ask {kind, params}`).
+A Claude session runs `node tools/advisor-watch.js --season` in the background;
+it exits when a question is pending, printing `{kind, basedOn, params, prompt,
+briefing}`. Write advice in the strict format (`ADVICE:` line + the kind's
+```json block, schemas in the briefing) and deliver with
+`node tools/advisor-submit.js --kind <kind> --based-on-token <w.r> --file f`,
+then re-arm the watcher. Advice kinds: `lineup | waiver | trade | matchup |
+power | recap`. Every tab's 📋 copies the full prompt for manual paste instead.
+
+**Phone access (Tailscale)**: the server listens on all interfaces, so once
+Windows Firewall allows inbound TCP 8484 (scoped to the tailnet:
+`netsh advfirewall firewall add rule name="Season War Room (tailnet)" dir=in
+action=allow protocol=TCP localport=8484 remoteip=100.64.0.0/10` in an
+elevated shell, one time), the app is at **http://\<your-pc-name\>:8484** from any
+tailnet device. The UI has a responsive phone layout (collapsed columns,
+scrollable tabs, bigger touch targets).
+
+**Testing without live games**: `node tools/season-snapshot.js --week 5 --synth
+--records --injure <pid>=Out` writes `data/season-fixture.json`;
+`SEASON_FIXTURE=1 node server.js` loads it with polling disabled.
+
+Caveats: projections/stats come from an undocumented Sleeper endpoint (the UI
+flags DEGRADED when sparse); Sleeper has no write API, so lineup changes are
+applied by hand in the Sleeper app; lineup locks are not visible here.
+
 ## Configuration (env vars)
 
 | Var | Default | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | required for the advisor |
+| `ANTHROPIC_API_KEY` | — | enables API mode (otherwise external/Claude Code mode) |
+| `ADVISOR` | auto | force `api` / `mock` / `external` (auto: key→api, MOCK_LLM→mock, else external) |
 | `PORT` | 8484 | UI/server port |
 | `REPLAY` | — | `1` = draft endpoints served by tools/replay.js |
 | `MOCK_LLM` | — | `1` = simulate the model (testing without a key) |
 | `EFFORT` | `high` | claude-fable-5 `output_config.effort` (low…max) |
 | `SPECULATE_WITHIN` | 2 | start precomputing when ≤ N picks from my turn |
 | `ADVICE_TIMEOUT_MS` | 150000 | hard cap per advice request |
+| `SEASON_POLL_MS` | 60000 | season poll base cadence |
+| `SEASON_FIXTURE` | — | `1` = load data/season-fixture.json, disable season polling |
+| `PLAYERS_REFRESH_MS` | 4h | in-season players-cache (injury) refresh age |
 | `POLL_MS` | 2000 | Sleeper poll interval |
 
 ## How the speed works

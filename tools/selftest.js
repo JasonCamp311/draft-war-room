@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 // Fast unit assertions over the pure math in server.js. Run: node tools/selftest.js
+delete process.env.ANTHROPIC_API_KEY;   // deterministic: always test external-advisor mode
+delete process.env.MOCK_LLM;
+delete process.env.ADVISOR;
 const S = require('../server.js');
 
 let pass = 0, fail = 0;
@@ -78,6 +81,217 @@ eq(headerHits('ECR'), ['rank'], 'ECR');
 eq(S.lev('mahomes', 'mahomes'), 0, 'lev exact');
 eq(S.lev('mahomes', 'mahomez'), 1, 'lev 1');
 eq(S.lev('abcdef', 'xyzuvw') > 2, true, 'lev far');
+
+// ---- external advisor gating (no key + no mock -> external mode)
+eq(S.ADVISOR, 'external', 'no key -> external advisor mode');
+S.ST.rankings = [{ rank: 1 }];
+S.ST.board = { status: 'drafting', mySlot: 5, picksUntilMine: 2, pickCount: 40 };
+eq(S.externalNeedAdvice(), true, 'need advice within window');
+S.ST.adv.latest = { basedOn: 40 };
+eq(S.externalNeedAdvice(), false, 'current rec suppresses need');
+S.ST.adv.latest = { basedOn: 38 };
+eq(S.externalNeedAdvice(), true, 'stale rec re-fires need');
+S.ST.board.picksUntilMine = 5;
+eq(S.externalNeedAdvice(), false, 'outside speculative window');
+S.ST.adv.extForce = true;
+eq(S.externalNeedAdvice(), true, 'manual refresh forces need');
+S.ST.board = { status: 'pre_draft', mySlot: 5, picksUntilMine: 4, pickCount: 0 };
+eq(S.externalNeedAdvice(), true, 'force works pre-draft (pre-baked round-1 rec)');
+S.ST.adv.extForce = false;
+eq(S.externalNeedAdvice(), false, 'pre-draft quiet without force');
+S.ST.adv.extForce = true;
+S.ST.board = { status: 'complete', mySlot: 5, picksUntilMine: 1, pickCount: 150 };
+eq(S.externalNeedAdvice(), false, 'force ignored once draft complete');
+S.ST.adv.extForce = false;
+S.ST.board = { status: 'complete', mySlot: 5, picksUntilMine: 1, pickCount: 150 };
+eq(S.externalNeedAdvice(), false, 'no need when not drafting');
+S.ST.board = null; S.ST.rankings = []; S.ST.adv.latest = null;
+
+// ---- advice format parsing (what /api/advisor/submit accepts)
+eq(S.parseAdviceJson('PICK: X (RB, SF)\n```json\n{"pick":{"name":"X"}}\n```\n'), { pick: { name: 'X' } }, 'fenced json parses');
+eq(S.parseAdviceJson('no json here'), null, 'garbage -> null');
+
+// ==================== season math ====================
+
+// ---- projPoints scoring-key selection
+eq(S.projPoints({ pts_ppr: 20, pts_half_ppr: 17, pts_std: 14 }, { rec: 1 }), 20, 'full PPR -> pts_ppr');
+eq(S.projPoints({ pts_ppr: 20, pts_half_ppr: 17, pts_std: 14 }, { rec: 0.5 }), 17, 'half PPR -> pts_half_ppr');
+eq(S.projPoints({ pts_ppr: 20, pts_half_ppr: 17, pts_std: 14 }, { rec: 0 }), 14, 'standard -> pts_std');
+eq(S.projPoints(null, { rec: 1 }), null, 'no stats -> null');
+eq(S.projPoints({ pts_ppr: 'x' }, { rec: 1 }), null, 'non-numeric -> null');
+
+// ---- parseStatRows (shared projections/stats parser, defensive)
+const psr = S.parseStatRows([
+  { player_id: '1', stats: { pts_ppr: 12.5 }, opponent: 'KC' },
+  { player_id: '2', stats: {} }, { nope: true }, null,
+], { rec: 1 });
+eq(psr.count, 1, 'parseStatRows counts only numeric pts');
+eq(psr.byId['1'], { pts: 12.5, opp: 'KC' }, 'parseStatRows row shape');
+eq(psr.byId['2'], { pts: null, opp: null }, 'row without pts kept (opp null)');
+eq(S.parseStatRows('garbage', {}).count, 0, 'non-array -> empty');
+
+// ---- optimalLineup (this league's shape: QB RB RB WR WR TE FLEX FLEX DEF)
+const RP = ['QB', 'RB', 'RB', 'WR', 'WR', 'TE', 'FLEX', 'FLEX', 'DEF', 'BN', 'BN'];
+const mk = (defs) => (pid) => defs[pid];                    // getInfo from a table
+const L1 = S.optimalLineup(['q1', 'r1', 'r2', 'r3', 'w1', 'w2', 'w3', 't1', 'd1'], RP, mk({
+  q1: { pos: 'QB', proj: 20, eff: 20 },
+  r1: { pos: 'RB', proj: 15, eff: 15 }, r2: { pos: 'RB', proj: 14, eff: 14 }, r3: { pos: 'RB', proj: 13, eff: 13 },
+  w1: { pos: 'WR', proj: 16, eff: 16 }, w2: { pos: 'WR', proj: 12, eff: 12 }, w3: { pos: 'WR', proj: 5, eff: 5 },
+  t1: { pos: 'TE', proj: 9, eff: 9 }, d1: { pos: 'DEF', proj: 8, eff: 8 },
+}));
+const slotPid = (L, slot, nth = 0) => L.slots.filter(s => s.slot === slot)[nth].pid;
+eq(slotPid(L1, 'QB'), 'q1', 'QB slot filled');
+eq(slotPid(L1, 'DEF'), 'd1', 'DEF slot filled');
+eq(L1.slots.filter(s => s.slot === 'FLEX').map(s => s.pid).sort(), ['r3', 'w3'], 'overflow RB + WR take the FLEX slots');
+eq(L1.total, 20 + 15 + 14 + 16 + 12 + 9 + 13 + 5 + 8, 'optimal total sums projections');
+
+// hard-out starter displaced (out RB scores 0, bench RB steps in)
+const L2 = S.optimalLineup(['r1', 'r2', 'r3'], ['RB', 'RB', 'BN'], mk({
+  r1: { pos: 'RB', proj: 15, eff: 15, out: true },
+  r2: { pos: 'RB', proj: 10, eff: 10 }, r3: { pos: 'RB', proj: 8, eff: 8 },
+}));
+eq(L2.slots.map(s => s.pid).sort(), ['r2', 'r3'], 'Out player displaced from optimal');
+eq(L2.total, 18, 'Out player contributes nothing to the total');
+
+// eff fallback: missing eff uses proj; missing both -> 0 (empty slot ok)
+const L3 = S.optimalLineup(['a'], ['QB', 'TE'], mk({ a: { pos: 'QB', proj: 7 } }));
+eq(slotPid(L3, 'QB'), 'a', 'eff defaults to proj');
+eq(slotPid(L3, 'TE'), null, 'unfillable slot stays empty');
+
+// ---- season state fixture for waiver/trade/need math
+const players = {
+  q1: { n: 'QB One', p: 'QB', t: 'AAA', sr: 1, inj: '' }, q2: { n: 'QB Two', p: 'QB', t: 'BBB', sr: 2, inj: '' },
+  r1: { n: 'RB One', p: 'RB', t: 'AAA', sr: 3, inj: '' }, r2: { n: 'RB Two', p: 'RB', t: 'BBB', sr: 4, inj: '' },
+  r3: { n: 'RB Three', p: 'RB', t: 'CCC', sr: 5, inj: 'Out' }, r4: { n: 'RB Four', p: 'RB', t: 'DDD', sr: 6, inj: '' },
+  w1: { n: 'WR One', p: 'WR', t: 'AAA', sr: 7, inj: '' }, w2: { n: 'WR Two', p: 'WR', t: 'BBB', sr: 8, inj: '' },
+  fa1: { n: 'FA Hot', p: 'RB', t: 'EEE', sr: 9, inj: '' }, fa2: { n: 'FA Cold', p: 'WR', t: 'FFF', sr: 10, inj: '' },
+  fa3: { n: 'FA Trend', p: 'TE', t: 'GGG', sr: 11, inj: '' },
+  b1: { n: 'Bench Guy', p: 'WR', t: 'HHH', sr: 12, inj: '' },
+};
+S.ST.players = players;
+S.ST.rankings = [
+  { rank: 1, player_id: 'q1', bye: 9 }, { rank: 2, player_id: 'r1', bye: 9 }, { rank: 3, player_id: 'w1', bye: 5 },
+  { rank: 10, player_id: 'r2' }, { rank: 20, player_id: 'w2' }, { rank: 30, player_id: 'q2' },
+  { rank: 40, player_id: 'r3' }, { rank: 60, player_id: 'r4' }, { rank: 80, player_id: 'fa1' },
+].map(r => ({ tier: null, name: players[r.player_id].n, pos: players[r.player_id].p, team: '', proj: null, notes: '', match: 'exact', ...r }));
+const RP2 = ['QB', 'RB', 'RB', 'WR', 'FLEX', 'BN', 'BN'];
+S.ST.season.league = { name: 'Test League', roster_positions: RP2, scoring_settings: { rec: 1 }, settings: { trade_deadline: 11, playoff_week_start: 15, waiver_type: 0 } };
+S.ST.season.nfl = { week: 3, season: '2026', season_type: 'regular' };
+S.ST.season.rosters = [
+  { roster_id: 1, owner_id: 'u1', players: ['q1', 'r1', 'r2', 'w1', 'r3', 'b1'], starters: ['q1', 'r1', 'r2', 'w1', 'r3'], settings: { wins: 2, losses: 0, fpts: 250, waiver_position: 12 } },
+  { roster_id: 2, owner_id: 'u2', players: ['q2', 'r4', 'w2'], starters: ['q2', 'r4', 'w2', '0', '0'], settings: { wins: 0, losses: 2, fpts: 180, waiver_position: 1 } },
+];
+S.ST.season.users = [{ user_id: 'u1', display_name: 'Me' }, { user_id: 'u2', display_name: 'Them' }];
+S.ST.season.matchups = [
+  { roster_id: 1, matchup_id: 1, points: 0, starters: [] },
+  { roster_id: 2, matchup_id: 1, points: 0, starters: [] },
+];
+S.ST.season.proj = {
+  week: 3, fetchedAt: Date.now(), degraded: false, count: 100,
+  byId: {
+    q1: { pts: 22, opp: 'KC' }, q2: { pts: 18, opp: 'SF' }, r1: { pts: 17, opp: 'KC' }, r2: { pts: 14, opp: 'DAL' },
+    r3: { pts: 12, opp: 'NYJ' }, r4: { pts: 11, opp: 'MIA' }, w1: { pts: 16, opp: 'KC' }, w2: { pts: 13, opp: 'DEN' },
+    fa1: { pts: 15, opp: 'LAC' }, fa2: { pts: 6, opp: 'CHI' }, b1: { pts: 7, opp: 'GB' },
+  },
+};
+S.ST.season.stats = { byWeek: { 1: { r1: 20, fa1: 18 }, 2: { r1: 10, fa1: 22 } } };
+S.ST.season.trending = { add: [{ player_id: 'fa1', count: 50000 }, { player_id: 'fa3', count: 90000 }], drop: [], fetchedAt: Date.now() };
+S.ST.session.league_id = '999'; S.ST.session.my_roster_id = 1;
+
+// ---- value blending
+const vals = S.buildValueIndex();
+eq(vals.get('q1').pre, 100, 'rank 1 -> preseason value 100');
+eq(vals.get('r1').ppg, 15, 'PPG averages completed weeks');
+eq(Math.abs(vals.get('r1').value - ((2 / 3) * (1000 / 11) + (1 / 3) * 60)) < 0.01, true, 'value blends pre (rank 2) with ppg*4 at week weight 2/6');
+eq(vals.get('fa2').value, 0, 'unranked, no games -> zero value');
+
+// ---- needs + waivers
+const profile = S.computeNeedProfile(vals);
+eq(profile.needs.QB, 'low', 'stacked QB reads low need');
+const wv = S.computeWaivers(vals);
+eq(wv.candidates.some(c => c.pid === 'fa1'), true, 'FA with projection appears');
+eq(wv.candidates.some(c => c.pid === 'fa3'), true, 'trending-only FA appears');
+eq(wv.candidates.some(c => ['q1', 'r1', 'q2', 'r4'].includes(c.pid)), false, 'rostered players never claimable');
+eq(wv.myWaiverPos, 12, 'my rolling waiver position surfaces');
+eq(wv.drops.map(d => d.pid), ['b1'], 'drops come from non-starters only');
+
+// ---- lineup (r3 is Out and started -> flagged + displaced in optimal)
+const lu = S.computeLineup(S.ST.season.rosters[0], RP2, vals);
+eq(lu.flags.some(f => f.pid === 'r3' && /Out/.test(f.reason)), true, 'Out starter flagged');
+eq(lu.optimal.some(o => o.pid === 'r3'), false, 'Out starter not in optimal');
+eq(lu.optTotal >= lu.curTotal, true, 'optimal never worse than current');
+
+// ---- trade eval
+const sym = S.computeTradeEval({ give: ['r2'], get: ['r4'], partner_roster_id: 2 });
+eq(sym.error === undefined, true, 'trade eval runs');
+eq(Math.abs(sym.myLineup.delta - (11 - 14)) < 0.01, true, 'lineup delta reflects the swap');
+const bad = S.computeTradeEval({ give: ['r4'], get: ['r2'], partner_roster_id: 2 });
+eq(!!bad.error, true, 'giving a player I do not roster errors');
+const up = S.computeTradeEval({ give: [], get: ['r4'], partner_roster_id: 2 });
+eq(up.myLineup.delta >= 0, true, 'pure gain never negative for me');
+
+// ---- trade scan
+const scan = S.computeTradeScan();
+eq(scan.matrix.length, 2, 'scan covers every roster');
+eq(scan.matrix.find(m => m.mine).roster_id, 1, 'scan marks my roster');
+
+// ---- season view + token + advice gating
+S.ST.season.adviceRev = 4;
+eq(S.seasonToken(), 'w3.r4', 'token = week + adviceRev');
+const view = S.computeSeason();
+eq(view.standings[0].roster_id, 1, '2-0 team tops standings');
+eq(view.standings[0].power >= view.standings[1].power, true, 'power score ordering sane');
+eq(view.matchup.opp.roster_id, 2, 'matchup pairs by matchup_id');
+eq(view.myRoster.players.length, 6, 'my roster resolves');
+S.ST.adv.season.pending = { waiver: { since: 2, params: null }, lineup: { since: 1, params: null } };
+const needs2 = S.seasonNeedAdvice();
+eq(needs2.map(n => n.kind), ['lineup', 'waiver'], 'pending sorted oldest-first');
+eq(needs2[0].basedOn, 'w3.r4', 'pending carries the freshness token');
+S.ST.adv.season.pending = {};
+
+// ---- bye planner (my roster byes from the CSV: q1/r1 wk9, w1 wk5)
+const bp = S.computeByePlan(vals);
+eq(bp.map(b => b.week), [5, 9], 'bye weeks sorted');
+eq(bp.find(b => b.week === 9).players.length, 2, 'two players share the wk9 bye');
+eq(bp.find(b => b.week === 5).past, false, 'wk5 bye is upcoming at wk3');
+eq(bp.some(b => b.crunch), false, 'no 3+ crunch in this fixture');
+
+// ---- playoff odds (seeded rng; stacked team must dominate)
+S.ST.season.league.settings.playoff_week_start = 6;
+S.ST.season.league.settings.playoff_teams = 1;
+S.ST.season.leagueSchedule = { 4: [{ roster_id: 1, matchup_id: 1 }, { roster_id: 2, matchup_id: 1 }], 5: [{ roster_id: 1, matchup_id: 1 }, { roster_id: 2, matchup_id: 1 }] };
+let seed = 42;
+const lcg = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+const oddsTeams = [
+  { roster_id: 1, wins: 2, losses: 0, ties: 0, fpts: 250, optProj: 140 },
+  { roster_id: 2, wins: 0, losses: 2, ties: 0, fpts: 180, optProj: 95 },
+];
+const odds = S.computePlayoffOdds(oddsTeams, { rng: lcg, sims: 500 });
+eq(odds[1] > 95, true, '2-0 stronger team locks the single playoff spot');
+eq(odds[1] + odds[2] >= 100, true, 'one of two teams always makes a 1-spot playoff');
+
+// ---- recap math
+S.ST.season.matchupHistory[2] = [
+  { roster_id: 1, matchup_id: 1, points: 100, starters: ['q1', 'r1', 'r2', 'w1', 'r3'], players: ['q1', 'r1', 'r2', 'w1', 'r3', 'b1'] },
+  { roster_id: 2, matchup_id: 1, points: 90, starters: ['q2', 'r4', 'w2'], players: ['q2', 'r4', 'w2'] },
+];
+S.ST.season.stats.byWeek[2] = { q1: 30, r1: 25, r2: 20, w1: 15, r3: 0, b1: 18, q2: 40, r4: 30, w2: 20 };
+const recap = S.computeRecap(2);
+eq(recap.my.won, true, 'recap sees the win');
+eq(recap.my.points, 100, 'my points from archived matchup');
+// hindsight optimal: q1 30 + best RB pair 25/20 + w1 15 + flex b1 18 = 108 -> regret 8
+eq(recap.my.optimal, 108, 'hindsight optimal from actuals');
+eq(recap.my.benchRegret, 8, 'bench regret = optimal - actual');
+eq(recap.results.length, 1, 'league results paired');
+
+// ---- injury alerts (seed silently, then alert on change; drops dedupe per week)
+S.ST.season.alerts = []; S.ST.season.injSeen = {};
+eq(S.checkInjuryAlerts(), false, 'first pass seeds without alerting');
+S.ST.players.r1.inj = 'Questionable';
+eq(S.checkInjuryAlerts(), true, 'status change alerts');
+eq(S.ST.season.alerts[0].pid, 'r1', 'alert names the player');
+eq(S.checkInjuryAlerts(), false, 'no duplicate alert for same status');
+S.ST.players.r1.inj = '';
 
 console.log(`\nselftest: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

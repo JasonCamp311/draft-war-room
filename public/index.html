@@ -250,12 +250,19 @@
 
 <main id="tab-draft" class="tabpane hidden">
   <div class="paneBar">
+    <select id="source" title="Where the draft is hosted"><option value="sleeper">Sleeper</option><option value="espn">ESPN</option></select>
     <input id="draftId" placeholder="Sleeper draft ID" size="20">
     <select id="mySlot"><option value="">my slot…</option></select>
     <button id="connectBtn" class="primary">Connect</button>
     <label><input type="file" id="csvFile" accept=".csv,text/csv" style="display:none">
       <button id="csvBtn" onclick="document.getElementById('csvFile').click()">Import CSV</button>
     </label>
+  </div>
+  <div class="paneBar hidden" id="espnRow">
+    <input id="espnSeason" placeholder="season" size="5" inputmode="numeric" title="Season year">
+    <input id="espnS2" type="password" placeholder="espn_s2 cookie (private leagues)" size="28" autocomplete="off">
+    <input id="espnSwid" type="password" placeholder="SWID cookie {…}" size="20" autocomplete="off">
+    <span class="muted" style="font-size:12px;">League ID is in the ESPN URL (<code>leagueId=…</code>). Cookies: browser DevTools → Application → Cookies → fantasy.espn.com. Saved locally; blank keeps the last ones.</span>
   </div>
   <section class="panel">
     <h2>Available board <input id="search" placeholder="filter…"> <span id="availCount" class="muted"></span></h2>
@@ -416,9 +423,9 @@ function connectSSE() {
     S.board = d.board; S.rankings = d.rankings || []; S.rankingsMeta = d.rankingsMeta;
     S.session = d.session; S.status = d.status;
     if (d.session) {
-      if (d.session.draft_id) $('draftId').value = d.session.draft_id;
+      applySessionToForm(d.session);
       if (d.session.league_id) $('leagueId').value = d.session.league_id;
-      populateSlots(S.board ? S.board.teams : 14, d.session.my_slot);
+      populateSlots(S.board ? S.board.teams : 14, d.session.my_slot, S.board ? S.board.slotNames : null);
     }
     S.lastDone = d.advice || null;
     if (d.adviceInflight) {
@@ -437,7 +444,12 @@ function connectSSE() {
   es.addEventListener('board', (e) => { S.board = JSON.parse(e.data); renderAll(); });
   es.addEventListener('rankings', (e) => { const d = JSON.parse(e.data); S.rankings = d.rankings; S.rankingsMeta = d.meta; renderRankings(); });
   es.addEventListener('status', (e) => { S.status = JSON.parse(e.data); renderStatus(); renderBanners(); });
-  es.addEventListener('session', (e) => { S.session = JSON.parse(e.data); renderBanners(); renderRankings(); });
+  es.addEventListener('session', (e) => {
+    S.session = JSON.parse(e.data);
+    applySessionToForm(S.session);
+    if (S.session.my_slot && $('mySlot').value !== String(S.session.my_slot)) populateSlots(S.board ? S.board.teams : 14, S.session.my_slot, S.board ? S.board.slotNames : null);
+    renderBanners(); renderRankings();
+  });
   es.addEventListener('advice', (e) => {
     const d = JSON.parse(e.data);
     if (d.phase === 'done') {
@@ -483,14 +495,49 @@ async function api(pathname, body) {
   return j;
 }
 
+function provider() { return (S.session && S.session.source) === 'espn' || $('source').value === 'espn' ? 'ESPN' : 'Sleeper'; }
+function applySessionToForm(s) {
+  const src = s.source || 'sleeper';
+  $('source').value = src;
+  $('espnRow').classList.toggle('hidden', src !== 'espn');
+  $('draftId').placeholder = src === 'espn' ? 'ESPN league ID' : 'Sleeper draft ID';
+  if (src === 'espn') {
+    const e = s.espn || {};
+    if (e.league_id) $('draftId').value = e.league_id;
+    if (e.season) $('espnSeason').value = e.season;
+    if (e.hasCookies) { $('espnS2').placeholder = 'espn_s2 (saved ✓ — blank keeps it)'; $('espnSwid').placeholder = 'SWID (saved ✓)'; }
+  } else if (s.draft_id) $('draftId').value = s.draft_id;
+}
+$('source').onchange = () => {
+  const espn = $('source').value === 'espn';
+  $('espnRow').classList.toggle('hidden', !espn);
+  $('draftId').placeholder = espn ? 'ESPN league ID' : 'Sleeper draft ID';
+  if (espn && !$('espnSeason').value) $('espnSeason').value = String(new Date().getMonth() >= 2 ? new Date().getFullYear() : new Date().getFullYear() - 1);
+};
 $('connectBtn').onclick = async () => {
   try {
+    if ($('source').value === 'espn') {
+      const j = await api('/api/draft', {
+        source: 'espn', league_id: $('draftId').value.trim(), season: $('espnSeason').value.trim(),
+        espn_s2: $('espnS2').value.trim(), swid: $('espnSwid').value.trim(),
+        my_slot: Number($('mySlot').value) || null, team_id: $('mySlot').selectedOptions[0] ? $('mySlot').selectedOptions[0].dataset.team : null,
+      });
+      $('espnS2').value = ''; $('espnSwid').value = '';
+      const names = {}; for (const t of j.teams || []) if (t.slot) names[t.slot] = t.name;
+      populateSlots(j.meta.teams, j.my_slot || Number($('mySlot').value) || null, j.order_set ? names : null, j.order_set ? null : j.teams);
+      toast(`Connected ESPN "${j.league_name}": ${j.meta.teams}-team ${j.meta.type} draft, ${j.meta.rounds} rounds, ${j.meta.scoring} (${j.status}${j.order_set ? '' : ' — draft order not set yet, pick your TEAM'})${j.unknown ? ` · ${j.unknown} unknown player id(s)` : ''}`);
+      return;
+    }
     const j = await api('/api/draft', { draft_id: $('draftId').value.trim(), my_slot: Number($('mySlot').value) || null });
     populateSlots(j.meta.teams, Number($('mySlot').value) || null);
     toast(`Connected: ${j.meta.teams}-team ${j.meta.type} draft, ${j.meta.rounds} rounds (${j.status})`);
   } catch (e) { toast('Connect failed: ' + e.message, 'bad'); }
 };
-$('mySlot').onchange = () => { if (S.session && S.session.draft_id) api('/api/slot', { my_slot: Number($('mySlot').value) || null }).catch(() => {}); };
+$('mySlot').onchange = () => {
+  if (!(S.session && S.session.draft_id)) return;
+  const opt = $('mySlot').selectedOptions[0];
+  api('/api/slot', { my_slot: Number($('mySlot').value) || null, team_id: opt && opt.dataset.team ? opt.dataset.team : null }).catch(() => {});
+};
 $('refreshAdvice').onclick = () => api('/api/advise/refresh').catch((e) => toast(e.message, 'bad'));
 $('copyPrompt').onclick = async () => {
   try {
@@ -513,11 +560,19 @@ $('csvFile').onchange = async (ev) => {
   } catch (e) { toast('Import failed: ' + e.message, 'bad'); }
   ev.target.value = '';
 };
-function populateSlots(teams, selected) {
+// names: {slot: teamName} labels the slots (ESPN). teamList: [{id,name}] when the
+// draft order is not set yet — options then carry the team id instead of a slot.
+function populateSlots(teams, selected, names, teamList) {
   const sel = $('mySlot');
   const cur = selected != null ? String(selected) : sel.value;
+  if (teamList && teamList.length && !(names && Object.keys(names).length)) {
+    const curTeam = (S.session && S.session.espn && S.session.espn.team_id) || null;
+    sel.innerHTML = '<option value="">my team…</option>' + teamList.map((t) => `<option value="" data-team="${t.id}">${esc(t.name)}</option>`).join('');
+    if (curTeam != null) { const o = [...sel.options].find((x) => x.dataset.team === String(curTeam)); if (o) o.selected = true; }
+    return;
+  }
   sel.innerHTML = '<option value="">my slot…</option>' +
-    Array.from({ length: teams || 14 }, (_, i) => `<option value="${i + 1}">slot ${i + 1}</option>`).join('');
+    Array.from({ length: teams || 14 }, (_, i) => `<option value="${i + 1}">slot ${i + 1}${names && names[i + 1] ? ' · ' + esc(names[i + 1]) : ''}</option>`).join('');
   if (cur) sel.value = cur;
 }
 function mark(pid, drafted) { api('/api/mark', { player_id: pid, drafted }).catch((e) => toast(e.message, 'bad')); }
@@ -543,7 +598,7 @@ function renderStatus() {
   const st = S.status || {};
   const degraded = st.degraded || (S.board && S.board.degraded);
   if (!S.esOpen) { dot.className = 'dot bad'; txt.textContent = 'reconnecting to server…'; return; }
-  if (degraded) { dot.className = 'dot bad'; txt.textContent = 'Sleeper degraded — retrying (state kept)'; return; }
+  if (degraded) { dot.className = 'dot bad'; txt.textContent = provider() + ' degraded — retrying (state kept)'; return; }
   dot.className = 'dot ok';
   const bits = [];
   if (st.replay) bits.push('REPLAY');
@@ -563,7 +618,7 @@ function renderBanners() {
     for (const a of board.anomalies || []) out.push(`<div class="banner warn">⚠ ${esc(a)}</div>`);
     for (const u of board.unmatchedPicks || []) out.push(`<div class="banner bad">⚠ Pick #${u.pick_no}: unknown player id ${esc(u.player_id)} — board may be off by one.</div>`);
     if (board.unresolvedCsv > 0) out.push(`<div class="banner warn">⚠ ${board.unresolvedCsv} CSV row(s) not matched to Sleeper players — they may not clear the board when picked. Fix or X them manually.</div>`);
-    if (board.status === 'pre_draft') out.push('<div class="banner info">Draft has not started — waiting for Sleeper.</div>');
+    if (board.status === 'pre_draft') out.push(`<div class="banner info">Draft has not started — waiting for ${provider()}.${board.source === 'espn' && !board.mySlot ? ' Pick your team above; the slot fills in once ESPN publishes the draft order.' : ''}</div>`);
     if (board.status === 'complete') out.push('<div class="banner info">Draft complete.</div>');
   }
   const manual = S.session && S.session.manual ? Object.keys(S.session.manual) : [];
@@ -589,7 +644,7 @@ function renderClock() {
   if (b.onClock) { el.innerHTML = '<b>YOU ARE ON THE CLOCK</b> — pick #' + b.currentPickNo; el.className = 'onclock'; return; }
   el.className = '';
   if (b.picksUntilMine != null && b.status === 'drafting')
-    el.innerHTML = `pick <b>#${b.currentPickNo}</b> R${b.currentRound} · slot ${b.onClockSlot} up · <b>${b.picksUntilMine}</b> until you (#${b.myNextPickNo})`;
+    el.innerHTML = `pick <b>#${b.currentPickNo}</b> R${b.currentRound} · slot ${b.onClockSlot}${b.slotNames && b.slotNames[b.onClockSlot] ? ' (' + esc(b.slotNames[b.onClockSlot]) + ')' : ''} up · <b>${b.picksUntilMine}</b> until you (#${b.myNextPickNo})`;
   else if (b.status === 'complete') el.textContent = 'draft complete';
   else el.textContent = 'waiting…';
 }

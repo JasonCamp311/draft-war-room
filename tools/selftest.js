@@ -293,5 +293,56 @@ eq(S.ST.season.alerts[0].pid, 'r1', 'alert names the player');
 eq(S.checkInjuryAlerts(), false, 'no duplicate alert for same status');
 S.ST.players.r1.inj = '';
 
+// ---- ESPN adapter (pure conversion of the league document into the Sleeper draft shape)
+{
+  const { buildLeague } = require('./espn-fixture.js');
+  const dir = {
+    101: { n: 'Ja\'Marr Chase', pos: 'WR', t: 'CIN' }, 102: { n: 'Bijan Robinson', pos: 'RB', t: 'ATL' },
+    103: { n: 'Bills D/ST', pos: 'DEF', t: 'BUF' }, 104: { n: 'Josh Allen', pos: 'QB', t: 'BUF' },
+  };
+  const lookup = (id) => dir[id] || null;
+  const resolve = (n, p, t) => (n === 'Bijan Robinson' ? { id: '9999' } : (p === 'DEF' ? { id: t } : null));
+  const picksFor = (n) => Array.from({ length: n }, (_, i) => ({ playerId: [101, 102, 103, 104][i % 4] }));
+  const raw = buildLeague({ teams: 10, picks: picksFor(12), pickOrder: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] });
+  const c = S.espnToDraft(raw, { teamId: 8, lookup, resolve });
+  eq(c.meta.settings.teams, 10, 'espn teams');
+  eq(c.meta.settings.rounds, 15, 'espn rounds = roster minus IR');
+  eq([c.meta.settings.slots_qb, c.meta.settings.slots_rb, c.meta.settings.slots_wr, c.meta.settings.slots_te, c.meta.settings.slots_flex, c.meta.settings.slots_def, c.meta.settings.slots_k, c.meta.settings.slots_bn], [1, 2, 2, 1, 1, 1, 1, 6], 'espn lineup slots');
+  eq(c.meta.metadata.scoring_type, 'ppr', 'espn ppr from statId 53');
+  eq(c.meta.type, 'snake', 'espn snake');
+  eq(c.meta.status, 'drafting', 'espn in-progress -> drafting');
+  eq(c.picks.length, 12, 'espn picks kept');
+  eq(c.picks[0].pick_no, 1, 'espn pick_no');
+  eq(c.picks[10].draft_slot, 10, 'espn R2P1 is slot 10 (snake)');
+  eq(c.picks[11].draft_slot, 9, 'espn R2P2 is slot 9');
+  eq(c.picks[10].round, 2, 'espn round');
+  eq(c.picks[0].player_id, 'espn:101', 'unresolved keeps espn id');
+  eq(c.picks[0].metadata, { first_name: "Ja'Marr", last_name: 'Chase', position: 'WR', team: 'CIN', espn_id: 101, keeper: false }, 'unresolved carries name metadata');
+  eq(c.picks[1].player_id, '9999', 'resolved to sleeper id');
+  eq(c.picks[2].player_id, 'BUF', 'DST resolves via team');
+  eq(c.mySlot, 3, 'my slot from pickOrder (team 8 is 3rd)');
+  eq(c.teams.find(t => t.id === 8).slot, 3, 'team slot exposed');
+  eq(c.teams[0].id, 10, 'teams sorted by slot');
+  eq(c.unknownIds, [], 'no unknown ids');
+  eq(S.espnToDraft(buildLeague({ teams: 10, picks: [] }), { lookup, resolve }).meta.status, 'pre_draft', 'no picks -> pre_draft');
+  eq(S.espnToDraft(buildLeague({ teams: 10, picks: picksFor(150) }), { lookup, resolve }).meta.status, 'complete', 'full board -> complete');
+  eq(S.espnToDraft(buildLeague({ teams: 10, picks: picksFor(3), drafted: true }), { lookup, resolve }).meta.status, 'complete', 'drafted flag -> complete');
+  // no pickOrder yet: slots inferred from round-1 picks; my slot unknown until my team picks
+  const noOrder = S.espnToDraft(buildLeague({ teams: 10, picks: picksFor(4), pickOrder: null }), { teamId: 7, lookup, resolve });
+  eq(noOrder.meta.order_set, false, 'order not set');
+  eq(noOrder.picks[3].draft_slot, 4, 'positional slot without order');
+  eq(noOrder.mySlot, null, 'my slot unknown before my first pick');
+  eq(S.espnToDraft(buildLeague({ teams: 10, picks: picksFor(4), pickOrder: null }), { teamId: 2, lookup, resolve }).mySlot, 2, 'my slot inferred from my R1 pick');
+  const unk = S.espnToDraft(buildLeague({ teams: 10, picks: [{ playerId: 555 }] }), { lookup, resolve });
+  eq(unk.unknownIds, [555], 'unknown id reported');
+  eq(unk.picks[0].player_id, 'espn:555', 'unknown pick keeps id');
+  eq(S.espnToDraft(buildLeague({ teams: 12, picks: [], ppr: 0.5 }), { lookup, resolve }).meta.metadata.scoring_type, 'half_ppr', 'half ppr');
+  eq(S.espnToDraft(buildLeague({ teams: 12, picks: [], type: 'AUCTION' }), { lookup, resolve }).meta.type, 'auction', 'auction flagged');
+  // the converted meta drives the existing snake math unchanged
+  eq(S.pickToSlot(11, c.meta).slot, 10, 'pickToSlot on espn meta');
+  eq(S.draftSlots(c.meta).FLEX, 1, 'draftSlots on espn meta');
+  eq(S.sessionView().espn.hasCookies, false, 'session view hides cookies');
+}
+
 console.log(`\nselftest: ${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

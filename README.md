@@ -29,8 +29,12 @@ node server.js
 
 Then, in the UI:
 
-- **Draft night**: Import your rankings CSV, paste the Sleeper **draft ID**
-  (from `sleeper.com/draft/nfl/<ID>`), pick your slot, Connect.
+- **Draft night (Sleeper)**: Import your rankings CSV, paste the Sleeper
+  **draft ID** (from `sleeper.com/draft/nfl/<ID>`), pick your slot, Connect.
+- **Draft night (ESPN)**: switch the source dropdown to **ESPN**, paste the
+  **league ID** (the `leagueId=` number in any ESPN league URL), the season, and
+  for a private league the `espn_s2` + `SWID` cookies (see below). Pick your team,
+  Connect. Your draft slot fills in automatically once ESPN publishes the order.
 - **In-season**: on the Dashboard tab paste your Sleeper **league ID** (from
   `sleeper.com/leagues/<ID>`) and pick your team.
 
@@ -105,6 +109,45 @@ During the draft:
       against a different draft, so the app doesn't resume the test draft.
 - [ ] (API mode only) `$env:ANTHROPIC_API_KEY` set + one real-API replay,
       checking `http://localhost:8484/api/latency` p50 ttft.
+
+---
+
+## ESPN drafts
+
+ESPN has no public API, but its league document
+(`lm-api-reads.fantasy.espn.com/…/leagues/<id>?view=mDraftDetail&view=mSettings&view=mTeam`)
+carries settings, teams, the draft order and every pick so far. The server polls
+it every 3 s (`ESPN_POLL_MS`) and translates it into the same board the Sleeper
+path produces: roster slots → starting-lineup counts, `statId 53` → PPR/half/std,
+snake order from `pickOrder`, and each ESPN player id → the matching Sleeper id
+by name/position/team (same matcher as the CSV import), so rankings, survival
+math, prompts and the advisor loop are unchanged. Auction drafts are flagged, not
+supported.
+
+**Private leagues need two cookies.** Log in to fantasy.espn.com, open DevTools
+→ Application → Cookies → `https://fantasy.espn.com`, copy `espn_s2` (long) and
+`SWID` (a `{GUID}`). Paste them into the ESPN row in the UI once — they are saved
+in `data/session.json` (gitignored, never sent to the browser) and survive
+resets. Alternatively set `ESPN_S2` / `ESPN_SWID` env vars. They expire after
+a long time but do re-copy them if Connect returns 401/403.
+
+**Before draft night, probe the league** — this is the one part that can only be
+verified against your real league:
+
+```powershell
+node tools/espn-probe.js --league <leagueId> --season 2026 --s2 "<espn_s2>" --swid "{...}" --team <yourTeamId>
+```
+
+It prints the league settings, every team with its slot, your slot, the picks
+made so far and whether each mapped to a Sleeper player, and saves the raw
+document to `data/espn-raw.json`. If the draft order isn't set yet, slots show
+`?` — connect anyway and pick your team; the slot fills in on its own.
+
+**Rehearsal without a league**: `node tools/espn-mock.js --interval 12` serves a
+synthetic 10-team ESPN league (id 424242) that makes a pick every N seconds using
+real player names; run the server with `$env:ESPN_BASE = "http://127.0.0.1:3998"`
+and connect to it from the UI. Controls mirror the Sleeper replay harness
+(`/control/pause|resume|release|status` on port 3998).
 
 ---
 
@@ -233,6 +276,9 @@ applied by hand in the Sleeper app; lineup locks are not visible here.
 | `SEASON_FIXTURE` | — | `1` = load data/season-fixture.json, disable season polling |
 | `PLAYERS_REFRESH_MS` | 4h | in-season players-cache (injury) refresh age |
 | `POLL_MS` | 2000 | Sleeper poll interval |
+| `ESPN_POLL_MS` | 3000 | ESPN poll interval |
+| `ESPN_S2` / `ESPN_SWID` | — | ESPN cookies for private leagues (or paste them in the UI) |
+| `ESPN_BASE` | real API | override to `http://127.0.0.1:3998` for tools/espn-mock.js |
 
 ## How the speed works
 

@@ -2,7 +2,10 @@
 
 Fantasy-football assistant with two parallel subsystems sharing one server + one
 single-file UI:
-- **Draft mode** (original): tracks a Sleeper draft in real time, Claude recommends picks.
+- **Draft mode** (original): tracks a Sleeper **or ESPN** draft in real time, Claude recommends
+  picks. ESPN support is an adapter (`espnToDraft`, section 7b) that turns ESPN's league
+  document into the Sleeper `{meta, picks}` shape, mapping ESPN player ids to Sleeper ids by
+  name — everything downstream of the poller is source-agnostic. `session.source` picks the poller.
 - **Season mode**: league dashboard, start/sit lineup advice, waiver-wire advice,
   trade eval/scan, weekly matchup previews, power rankings. Advice kinds:
   `lineup | waiver | trade | matchup | power`, requested on demand from the UI
@@ -51,6 +54,9 @@ Three advisor sources (`ADVISOR` auto-detected, overridable):
   (`--week N --synth --records --injure pid=Out`); `SEASON_FIXTURE=1 node server.js`
   loads it and disables season polling — how season features are tested off-season.
 - `tools/make-sample-csv.js` — generates a test rankings CSV from the replay data.
+- `tools/espn-probe.js` — dumps + converts a real ESPN league (run before an ESPN draft night).
+- `tools/espn-mock.js` + `tools/espn-fixture.js` — synthetic ESPN API for rehearsals
+  (`ESPN_BASE=http://127.0.0.1:3998 node server.js`); the fixture builder also feeds selftest.
 - `tools/dresscheck.js` — headless client that runs a full replay and verifies the
   latency / matching / stability targets.
 - `tools/selftest.js` — unit assertions over the pure math (snake/reversal order,
@@ -85,6 +91,9 @@ See README.md for the draft-day runbook.
   wanted" (window ∧ no current rec, or manual ↻ force). A submission whose `basedOn`
   is behind the live board is accepted but tagged stale, and need re-fires — same
   refresh semantics as the API path. `/api/advisor/*` must never call Anthropic.
+- ESPN cookies (`session.espn.espn_s2/swid`) are secrets: only `sessionView()` goes to the
+  browser/tools, and it strips them. ESPN player-directory caches are keyed by season and
+  by real-vs-mock base URL so a rehearsal can never poison a real draft.
 - Tools must not call `process.exit()` while fetch/timeout handles are live — it
   crashes libuv on Windows (assertion in async.c). Set `process.exitCode` and return.
 - Season subsystem is PARALLEL to draft: `ST.season` + its own poll loop; draft code

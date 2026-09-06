@@ -11,6 +11,7 @@
  *   5. rankings import (CSV -> resolved rows)
  *   6. board computation (pure math: availability, gaps, survival, VORP, fallback)
  *   7. Sleeper poller (backoff, never dies)
+ *   7b. ESPN adapter + poller (translates ESPN's league doc into the Sleeper draft shape)
  *   8. advisor engine (speculative requests, stale guards, latency log)
  *   9. Anthropic streaming client (raw fetch SSE) + mock LLM
  *  10. SSE hub + HTTP server / routes
@@ -47,6 +48,9 @@ const SLEEPER_REAL = 'https://api.sleeper.app/v1';
 const SLEEPER_BASE = REPLAY ? `http://127.0.0.1:${REPLAY_PORT}/v1` : SLEEPER_REAL;
 // Undocumented Sleeper host for projections/stats (different host from the v1 API).
 const SLEEPER_STATS = 'https://api.sleeper.com';
+// ESPN fantasy (unofficial v3 API). Private leagues need the espn_s2 + SWID cookies.
+const ESPN_BASE = process.env.ESPN_BASE || 'https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl';   // env override = tools/espn-mock.js
+const ESPN_POLL_MS = Number(process.env.ESPN_POLL_MS || (REPLAY ? 1000 : 3000));
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-fable-5';
 
@@ -127,6 +131,21 @@ const ST = {
 if (ST.session.league_id === undefined) ST.session.league_id = null;
 if (ST.session.my_roster_id === undefined) ST.session.my_roster_id = null;
 if (ST.session.my_user_id === undefined) ST.session.my_user_id = null;
+// session.json v3: draft source ('sleeper' | 'espn') + ESPN connection details.
+// ESPN cookies live ONLY here (data/ is gitignored) and in env; never broadcast.
+if (!ST.session.source) ST.session.source = 'sleeper';
+if (!ST.session.espn) ST.session.espn = { league_id: null, season: null, team_id: null, espn_s2: null, swid: null };
+
+// What the UI/tools may see of the session (cookies stripped).
+function sessionView() {
+  const e = ST.session.espn || {};
+  return {
+    draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes,
+    league_id: ST.session.league_id, my_roster_id: ST.session.my_roster_id,
+    source: ST.session.source || 'sleeper',
+    espn: { league_id: e.league_id, season: e.season, team_id: e.team_id, hasCookies: !!(espnCookies()) },
+  };
+}
 
 // ------------------------------------------------- 3. players cache (24h TTL)
 
@@ -477,7 +496,7 @@ function computeBoard() {
   const byNo = new Map(picks.map(p => [p.pick_no, p]));
   let maxNo = 0;
   for (const p of picks) maxNo = Math.max(maxNo, p.pick_no);
-  for (let n = 1; n <= maxNo; n++) if (!byNo.has(n)) anomalies.push(`pick #${n} missing from Sleeper feed (skipped/removed?)`);
+  for (let n = 1; n <= maxNo; n++) if (!byNo.has(n)) anomalies.push(`pick #${n} missing from ${meta.source === 'espn' ? 'ESPN' : 'Sleeper'} feed (skipped/removed?)`);
   let slotMismatch = 0;
   for (const p of picks) {
     const exp = pickToSlot(p.pick_no, meta);
@@ -645,6 +664,8 @@ function computeBoard() {
 
     rosterBySlot, myNeeds, intervening, candidates, fallback,
     scoring: meta.metadata ? meta.metadata.scoring_type : null,
+    source: meta.source || 'sleeper',
+    slotNames: meta.espn_teams ? Object.fromEntries(meta.espn_teams.filter(t => t.slot).map(t => [t.slot, t.name])) : null,
     degraded: ST.poll.degraded, lastSyncAt: ST.poll.lastOkAt,
   };
   return ST.board;
@@ -653,11 +674,14 @@ function computeBoard() {
 // ------------------------------------------------- 7. Sleeper poller
 
 let pollTick = 0;
-function startPolling() {
-  if (ST.poll.running) return;
+function startPolling(restart = false) {
+  // restart: a (re)connect must poll NOW, not after a completed draft's 30s idle delay.
+  // Safe: scheduleNextPoll clears the previous timer, so there is never more than one loop.
+  if (ST.poll.running && !restart) return;
   ST.poll.running = true;
   scheduleNextPoll(0);
-  log(`polling ${SLEEPER_BASE} for draft ${ST.session.draft_id} every ${POLL_MS}ms`);
+  if (ST.session.source === 'espn') log(`polling ESPN league ${(ST.session.espn || {}).league_id} (${(ST.session.espn || {}).season}) every ${ESPN_POLL_MS}ms`);
+  else log(`polling ${SLEEPER_BASE} for draft ${ST.session.draft_id} every ${POLL_MS}ms`);
 }
 
 function scheduleNextPoll(delay) {
@@ -666,6 +690,7 @@ function scheduleNextPoll(delay) {
 }
 
 async function pollOnce() {
+  if (ST.session.source === 'espn') return pollEspnOnce();
   const id = ST.session.draft_id;
   if (!id) { ST.poll.running = false; return; }
   let delay = POLL_MS;
@@ -713,7 +738,214 @@ async function pollOnce() {
 }
 
 function pollStatus() {
-  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR };
+  return { degraded: ST.poll.degraded, failures: ST.poll.failures, lastSyncAt: ST.poll.lastOkAt, replay: REPLAY, mockLLM: MOCK_LLM, hasKey: !!process.env.ANTHROPIC_API_KEY, advisor: ADVISOR, source: ST.session.source || 'sleeper' };
+}
+
+// ------------------------------------------------- 7b. ESPN adapter + poller
+//
+// ESPN exposes one league document (?view=mDraftDetail&view=mSettings&view=mTeam)
+// that carries settings, teams, the pick order and every pick made so far. We
+// translate it into the exact {meta, picks} shape the Sleeper poller produces, so
+// the board math, prompts and UI stay byte-identical. ESPN player ids are mapped
+// to Sleeper ids by name/pos/team (same resolver the CSV import uses); a pick we
+// cannot map keeps an 'espn:<id>' id plus name metadata, which the board's
+// name-fallback still clears from the rankings.
+
+const ESPN_POS = { 1: 'QB', 2: 'RB', 3: 'WR', 4: 'TE', 5: 'K', 16: 'DEF' };
+const ESPN_PRO_TEAM = {
+  0: '', 1: 'ATL', 2: 'BUF', 3: 'CHI', 4: 'CIN', 5: 'CLE', 6: 'DAL', 7: 'DEN', 8: 'DET', 9: 'GB', 10: 'TEN',
+  11: 'IND', 12: 'KC', 13: 'LV', 14: 'LAR', 15: 'MIA', 16: 'MIN', 17: 'NE', 18: 'NO', 19: 'NYG', 20: 'NYJ',
+  21: 'PHI', 22: 'ARI', 23: 'PIT', 24: 'LAC', 25: 'SF', 26: 'SEA', 27: 'TB', 28: 'WAS', 29: 'CAR', 30: 'JAX',
+  33: 'BAL', 34: 'HOU',
+};
+// lineupSlotCounts ids -> our slot keys (ids not listed are ignored; 21 = IR is not drafted)
+const ESPN_LINEUP_SLOT = { 0: 'slots_qb', 1: 'slots_qb', 2: 'slots_rb', 3: 'slots_wr_rb', 4: 'slots_wr', 5: 'slots_rec_flex', 6: 'slots_te', 7: 'slots_super_flex', 16: 'slots_def', 17: 'slots_k', 20: 'slots_bn', 23: 'slots_flex' };
+
+function espnCookies() {
+  const e = ST.session.espn || {};
+  const s2 = e.espn_s2 || process.env.ESPN_S2 || '';
+  const swid = e.swid || process.env.ESPN_SWID || '';
+  if (!s2 || !swid) return null;
+  return `espn_s2=${s2}; SWID=${swid}`;
+}
+
+function espnHeaders(extra = {}) {
+  const h = { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DraftWarRoom/1.0', accept: 'application/json', ...extra };
+  const c = espnCookies();
+  if (c) h.cookie = c;
+  return h;
+}
+
+function espnSeasonDefault() {
+  const d = new Date();
+  return d.getMonth() >= 2 ? d.getFullYear() : d.getFullYear() - 1;   // Mar+ = new season
+}
+
+function espnLeagueUrl(leagueId, season) {
+  return `${ESPN_BASE}/seasons/${season}/segments/0/leagues/${leagueId}?view=mDraftDetail&view=mSettings&view=mTeam`;
+}
+
+async function fetchEspnLeague(leagueId, season) {
+  return fetchJson(espnLeagueUrl(leagueId, season), { headers: espnHeaders() }, 12000);
+}
+
+// ESPN player directory (id -> {n, pos, t}); cached per season for 24h. Used to
+// name picks. Non-fatal on failure: unknown ids are resolved on demand below.
+const espnPlayers = { season: null, byId: {}, fetchedAt: 0, loading: null };
+function espnPlayerRow(p) {
+  if (!p || p.id == null) return null;
+  return { n: p.fullName || `${p.firstName || ''} ${p.lastName || ''}`.trim(), pos: ESPN_POS[p.defaultPositionId] || '', t: ESPN_PRO_TEAM[p.proTeamId] || '' };
+}
+async function loadEspnPlayers(season) {
+  if (espnPlayers.season === season && Date.now() - espnPlayers.fetchedAt < PLAYERS_TTL_MS) return;
+  if (espnPlayers.loading) return espnPlayers.loading;
+  espnPlayers.loading = (async () => {
+    const name = `espn-players-${ESPN_BASE.includes('espn.com') ? '' : 'mock-'}${season}.json`;   // a mock's ids must never poison the real cache
+    const cache = loadJson(name, null);
+    if (cache && Date.now() - cache.fetchedAt < PLAYERS_TTL_MS) {
+      espnPlayers.season = season; espnPlayers.byId = cache.byId; espnPlayers.fetchedAt = cache.fetchedAt;
+      log(`espn players ${season}: ${Object.keys(cache.byId).length} from cache`);
+      return;
+    }
+    try {
+      const url = `${ESPN_BASE}/seasons/${season}/players?scoringPeriodId=0&view=players_wl`;
+      const list = await fetchJson(url, { headers: espnHeaders({ 'x-fantasy-filter': JSON.stringify({ filterActive: { value: true } }) }) }, 30000);
+      const byId = {};
+      for (const p of (Array.isArray(list) ? list : [])) { const row = espnPlayerRow(p); if (row && row.pos) byId[p.id] = row; }
+      espnPlayers.season = season; espnPlayers.byId = byId; espnPlayers.fetchedAt = Date.now();
+      saveJson(name, { fetchedAt: espnPlayers.fetchedAt, byId });
+      log(`espn players ${season}: ${Object.keys(byId).length} fetched`);
+    } catch (e) {
+      if (cache) { espnPlayers.season = season; espnPlayers.byId = cache.byId; espnPlayers.fetchedAt = cache.fetchedAt; }
+      else if (espnPlayers.season !== season) { espnPlayers.season = season; espnPlayers.byId = {}; espnPlayers.fetchedAt = 0; }
+      warn(`espn players fetch failed (non-fatal, ids resolved on demand): ${e.message}`);
+    }
+  })().finally(() => { espnPlayers.loading = null; });
+  return espnPlayers.loading;
+}
+// Look up specific ESPN player ids via the league's kona_player_info view.
+async function espnLookupIds(leagueId, season, ids) {
+  if (!ids.length) return;
+  const url = `${ESPN_BASE}/seasons/${season}/segments/0/leagues/${leagueId}?view=kona_player_info`;
+  const filter = { players: { filterIds: { value: ids.slice(0, 50) }, limit: 50 } };
+  const j = await fetchJson(url, { headers: espnHeaders({ 'x-fantasy-filter': JSON.stringify(filter) }) }, 12000);
+  let n = 0;
+  for (const e of (j && j.players) || []) { const row = espnPlayerRow(e.player || e); if (row) { espnPlayers.byId[e.id != null ? e.id : e.player.id] = row; n++; } }
+  if (n) saveJson(`espn-players-${season}.json`, { fetchedAt: espnPlayers.fetchedAt || Date.now(), byId: espnPlayers.byId });
+  return n;
+}
+
+// Pure: ESPN league document -> {meta, picks, teams, mySlot, unknownIds}.
+// `lookup(id)` returns {n,pos,t} or null; `resolve(name,pos,team)` returns {id} or null.
+function espnToDraft(raw, opts = {}) {
+  const lookup = opts.lookup || ((id) => espnPlayers.byId[id] || null);
+  const resolve = opts.resolve || ((n, p, t) => (ST.nameIndex ? resolvePlayer(n, p, t) : null));
+  const settings = raw.settings || {};
+  const ds = settings.draftSettings || {};
+  const lsc = (settings.rosterSettings && settings.rosterSettings.lineupSlotCounts) || {};
+  const teamsRaw = raw.teams || [];
+  const teamCount = settings.size || teamsRaw.length || 10;
+  const s = { teams: teamCount, rounds: 0, reversal_round: 0 };
+  for (const [id, cnt] of Object.entries(lsc)) {
+    const key = ESPN_LINEUP_SLOT[id];
+    if (key) s[key] = (s[key] || 0) + Number(cnt || 0);
+    if (Number(id) !== 21) s.rounds += Number(cnt || 0);     // everything but IR is drafted
+  }
+  for (const k of ['slots_qb', 'slots_rb', 'slots_wr', 'slots_te', 'slots_flex', 'slots_super_flex', 'slots_wr_rb', 'slots_rec_flex', 'slots_k', 'slots_def', 'slots_bn']) if (!s[k]) s[k] = 0;
+  if (!s.rounds) s.rounds = 16;
+  // scoring type from the receptions stat (statId 53)
+  let scoring = 'std';
+  const items = (settings.scoringSettings && settings.scoringSettings.scoringItems) || [];
+  const rec = items.find(i => i.statId === 53);
+  if (rec && rec.points >= 0.9) scoring = 'ppr'; else if (rec && rec.points > 0) scoring = 'half_ppr';
+  const dtype = String(ds.type || 'SNAKE').toUpperCase();
+  const type = dtype === 'AUCTION' ? 'auction' : 'snake';
+  const order = Array.isArray(ds.pickOrder) ? ds.pickOrder.filter(x => x != null) : [];
+  const teamName = (t) => (t.name || `${t.location || ''} ${t.nickname || ''}`.trim() || `Team ${t.id}`);
+  const members = new Map((raw.members || []).map(m => [m.id, m.displayName || `${m.firstName || ''} ${m.lastName || ''}`.trim()]));
+  const positionalSlot = (round, rpn) => (type === 'auction' ? rpn : (round % 2 === 1 ? rpn : teamCount - rpn + 1));
+  const dd = raw.draftDetail || {};
+  const rawPicks = (dd.picks || []).filter(p => p && p.playerId != null && p.playerId !== 0 && p.overallPickNumber > 0)
+    .sort((a, b) => a.overallPickNumber - b.overallPickNumber);
+  // slot per team: pickOrder first, else infer from round-1 picks
+  const slotOfTeam = new Map(order.map((tid, i) => [tid, i + 1]));
+  for (const p of rawPicks) if (p.roundId === 1 && !slotOfTeam.has(p.teamId)) slotOfTeam.set(p.teamId, positionalSlot(1, p.roundPickNumber));
+  const unknownIds = [];
+  const picks = rawPicks.map(p => {
+    const pl = lookup(p.playerId);
+    if (!pl) unknownIds.push(p.playerId);
+    const name = pl ? pl.n : '';
+    const r = pl ? resolve(pl.n, pl.pos, pl.t) : null;
+    const parts = name.split(' ');
+    const slot = slotOfTeam.get(p.teamId) || positionalSlot(p.roundId, p.roundPickNumber);
+    return {
+      round: p.roundId, pick_no: p.overallPickNumber, draft_slot: slot,
+      player_id: r ? r.id : `espn:${p.playerId}`, roster_id: p.teamId, picked_by: String(p.teamId),
+      metadata: { first_name: parts[0] || '', last_name: parts.slice(1).join(' '), position: pl ? pl.pos : '', team: pl ? pl.t : '', espn_id: p.playerId, keeper: !!p.keeper },
+    };
+  });
+  const total = s.teams * s.rounds;
+  let status = 'pre_draft';
+  if (dd.drafted || (picks.length && picks.length >= total)) status = 'complete';
+  else if (dd.inProgress || picks.length) status = 'drafting';
+  const teams = teamsRaw.map(t => ({ id: t.id, name: teamName(t), abbrev: t.abbrev || '', slot: slotOfTeam.get(t.id) || null, owner: members.get((t.owners || [])[0] || t.primaryOwner) || null }))
+    .sort((a, b) => (a.slot || 99) - (b.slot || 99) || a.id - b.id);
+  const mySlot = opts.teamId != null ? (slotOfTeam.get(Number(opts.teamId)) || null) : null;
+  const meta = {
+    draft_id: `espn:${raw.id || settings.id || ''}`, source: 'espn', status, type, settings: s,
+    metadata: { scoring_type: scoring, name: settings.name || '' },
+    start_time: ds.date || null, league_id: null, espn_teams: teams, order_set: order.length > 0,
+  };
+  return { meta, picks, teams, mySlot, unknownIds: [...new Set(unknownIds)] };
+}
+
+async function pollEspnOnce() {
+  const e = ST.session.espn || {};
+  const key = `${e.league_id}|${e.season}`;
+  if (!e.league_id) { ST.poll.running = false; return; }
+  let delay = ESPN_POLL_MS;
+  try {
+    pollTick++;
+    await loadEspnPlayers(e.season);
+    const raw = await fetchEspnLeague(e.league_id, e.season);
+    if (`${(ST.session.espn || {}).league_id}|${(ST.session.espn || {}).season}` !== key) return scheduleNextPoll(ESPN_POLL_MS);   // switched mid-fetch
+    let conv = espnToDraft(raw, { teamId: e.team_id });
+    if (conv.unknownIds.length) {
+      try { await espnLookupIds(e.league_id, e.season, conv.unknownIds); conv = espnToDraft(raw, { teamId: e.team_id }); }
+      catch (err) { warn(`espn id lookup failed (${conv.unknownIds.length} unknown): ${err.message}`); }
+    }
+    const prevStatus = ST.draft.status;
+    const first = !ST.draft.meta;
+    ST.draft.meta = conv.meta; ST.draft.status = conv.meta.status;
+    if (e.team_id != null && conv.mySlot && conv.mySlot !== ST.session.my_slot) {
+      ST.session.my_slot = conv.mySlot; saveJson('session.json', ST.session);
+      log(`espn: my team ${e.team_id} drafts from slot ${conv.mySlot}`);
+      broadcast('session', sessionView());
+    }
+    if (prevStatus && prevStatus !== conv.meta.status) {
+      log(`draft status: ${prevStatus} -> ${conv.meta.status}`);
+      if (conv.meta.status === 'complete') broadcast('toast', { kind: 'info', msg: 'Draft complete.' });
+      if (prevStatus === 'pre_draft' && conv.meta.status === 'drafting') broadcast('toast', { kind: 'info', msg: 'Draft is live!' });
+      computeVorp(); rebuildStaticPrefix();
+    } else if (first) { computeVorp(); rebuildStaticPrefix(); }
+    const changed = conv.picks.length !== ST.draft.picks.length || conv.picks.some((p, i) => p.player_id !== (ST.draft.picks[i] || {}).player_id);
+    ST.draft.picks = conv.picks;
+    computeBoard();
+    broadcast('board', ST.board);
+    if (changed) advisorOnBoardChange();
+    if (ST.poll.failures > 0) { log(`ESPN poll recovered after ${ST.poll.failures} failure(s)`); broadcast('status', pollStatus()); }
+    ST.poll.failures = 0; ST.poll.degraded = false; ST.poll.lastOkAt = Date.now();
+    if (ST.draft.status === 'complete') delay = 30000;
+    else if (ST.draft.status === 'pre_draft') delay = Math.max(ESPN_POLL_MS, 5000);
+  } catch (err) {
+    ST.poll.failures++;
+    ST.poll.degraded = ST.poll.failures >= 2;
+    delay = Math.min(15000, 1000 * 2 ** Math.min(ST.poll.failures - 1, 4));
+    warn(`ESPN poll failure #${ST.poll.failures}: ${err.message}; retry in ${delay}ms`);
+    if (ST.board) { ST.board.degraded = ST.poll.degraded; ST.board.lastSyncAt = ST.poll.lastOkAt; }
+    broadcast('status', pollStatus());
+  }
+  scheduleNextPoll(delay);
 }
 
 // --------------------------------- 8. advisor engine (speculative, guarded)
@@ -2347,7 +2579,7 @@ function snapshot() {
   for (const [kind, rec] of Object.entries(ST.adv.season.latest)) seasonAdvice[kind] = seasonAdviceEvent(rec);
   return {
     board: ST.board,
-    session: { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes, league_id: ST.session.league_id, my_roster_id: ST.session.my_roster_id },
+    session: sessionView(),
     rankingsMeta: ST.rankingsMeta,
     rankings: ST.rankings,
     advice: ST.adv.latest ? adviceEvent(ST.adv.latest) : null,
@@ -2435,6 +2667,48 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/draft' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req));
+      if (body.source === 'espn') {
+        const leagueId = String(body.league_id || '').trim();
+        if (!/^\d{3,25}$/.test(leagueId)) return json(res, 400, { error: 'league_id must be the numeric ESPN league id (from the league URL: leagueId=…)' });
+        const season = Number(body.season) || espnSeasonDefault();
+        const prevEspn = ST.session.espn || {};
+        // cookies: new values win; blank keeps whatever was stored (or env)
+        const s2 = String(body.espn_s2 || '').trim() || prevEspn.espn_s2 || null;
+        let swid = String(body.swid || '').trim() || prevEspn.swid || null;
+        if (swid && !swid.startsWith('{')) swid = `{${swid.replace(/[{}]/g, '')}}`;
+        ST.session.espn = { ...prevEspn, espn_s2: s2, swid };
+        let raw;
+        try {
+          await loadEspnPlayers(season);
+          raw = await fetchEspnLeague(leagueId, season);
+        } catch (e) {
+          ST.session.espn = prevEspn;
+          const hint = e.status === 401 || e.status === 403 ? ' — private league? paste espn_s2 + SWID cookies' : (e.status === 404 ? ' — check league id / season' : '');
+          return json(res, 502, { error: `could not fetch ESPN league: ${e.message}${hint}` });
+        }
+        const teamId = body.team_id != null && body.team_id !== '' ? Number(body.team_id) : null;
+        let conv = espnToDraft(raw, { teamId });
+        if (conv.unknownIds.length) { try { await espnLookupIds(leagueId, season, conv.unknownIds); conv = espnToDraft(raw, { teamId }); } catch (e) { warn('espn id lookup failed:', e.message); } }
+        // validated: commit
+        ST.session.source = 'espn';
+        ST.session.draft_id = `espn:${leagueId}`;
+        ST.session.espn = { ...ST.session.espn, league_id: leagueId, season, team_id: teamId };
+        ST.session.my_slot = conv.mySlot || Number(body.my_slot) || null;
+        saveJson('session.json', ST.session);
+        ST.draft = { meta: conv.meta, picks: conv.picks, anomalies: [], status: conv.meta.status };
+        ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.extForce = false; ST.adv.extNeedSince = null; if (ST.adv.inflight) abortInflight('draft-changed');
+        computeVorp(); rebuildStaticPrefix(); computeBoard();
+        prewarmCache();
+        startPolling(true);
+        broadcast('board', ST.board);
+        broadcast('status', pollStatus());
+        broadcast('session', sessionView());
+        return json(res, 200, {
+          ok: true, source: 'espn', status: ST.draft.status, league_name: conv.meta.metadata.name, order_set: conv.meta.order_set,
+          meta: { teams: conv.meta.settings.teams, rounds: conv.meta.settings.rounds, type: conv.meta.type, scoring: conv.meta.metadata.scoring_type },
+          teams: conv.teams, my_slot: ST.session.my_slot, picks: conv.picks.length, unknown: conv.unknownIds.length,
+        });
+      }
       const draftId = String(body.draft_id || '').trim();
       if (!/^\d{5,25}$/.test(draftId)) return json(res, 400, { error: 'draft_id must be the numeric Sleeper draft id' });
       let meta;
@@ -2442,6 +2716,7 @@ const server = http.createServer(async (req, res) => {
         meta = await fetchJson(`${SLEEPER_BASE}/draft/${draftId}`, {}, 10000);
       } catch (e) { return json(res, 502, { error: `could not fetch draft: ${e.message}` }); }
       // validated: now commit the session change
+      ST.session.source = 'sleeper';
       ST.session.draft_id = draftId;
       ST.session.my_slot = Number(body.my_slot) || null;
       saveJson('session.json', ST.session);
@@ -2449,7 +2724,7 @@ const server = http.createServer(async (req, res) => {
       ST.adv.latest = null; ST.adv.prevOnClock = false; ST.adv.extForce = false; ST.adv.extNeedSince = null; if (ST.adv.inflight) abortInflight('draft-changed');
       computeVorp(); rebuildStaticPrefix(); computeBoard();
       prewarmCache();                       // fire-and-forget
-      startPolling();
+      startPolling(true);
       broadcast('board', ST.board);
       broadcast('status', pollStatus());
       return json(res, 200, { ok: true, status: ST.draft.status, meta: { teams: ST.draft.meta.settings.teams, rounds: ST.draft.meta.settings.rounds, type: ST.draft.meta.type } });
@@ -2458,7 +2733,16 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/slot' && req.method === 'POST') {
       const body = JSON.parse(await readBody(req));
       ST.session.my_slot = Number(body.my_slot) || null;
+      if (ST.session.source === 'espn') {
+        // ESPN: the slot select carries team ids when the order isn't set yet; keep team_id in sync either way
+        const teams = (ST.draft.meta && ST.draft.meta.espn_teams) || [];
+        let t = body.team_id != null && body.team_id !== '' ? teams.find(x => x.id === Number(body.team_id)) : null;
+        if (!t && ST.session.my_slot) t = teams.find(x => x.slot === ST.session.my_slot) || null;
+        ST.session.espn = { ...(ST.session.espn || {}), team_id: t ? t.id : (body.team_id != null && body.team_id !== '' ? Number(body.team_id) : null) };
+        if (t && t.slot) ST.session.my_slot = t.slot;
+      }
       saveJson('session.json', ST.session);
+      broadcast('session', sessionView());
       computeBoard(); broadcast('board', ST.board);
       advisorOnBoardChange();
       return json(res, 200, { ok: true });
@@ -2471,7 +2755,7 @@ const server = http.createServer(async (req, res) => {
       else delete ST.session.manual[body.player_id];
       saveJson('session.json', ST.session);
       computeBoard(); broadcast('board', ST.board);
-      broadcast('session', { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes });
+      broadcast('session', sessionView());
       return json(res, 200, { ok: true });
     }
 
@@ -2481,7 +2765,7 @@ const server = http.createServer(async (req, res) => {
       if (body.note) ST.session.notes[body.player_id] = String(body.note).slice(0, 300);
       else delete ST.session.notes[body.player_id];
       saveJson('session.json', ST.session);
-      broadcast('session', { draft_id: ST.session.draft_id, my_slot: ST.session.my_slot, manual: ST.session.manual, notes: ST.session.notes });
+      broadcast('session', sessionView());
       return json(res, 200, { ok: true });
     }
 
@@ -2598,8 +2882,11 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/reset' && req.method === 'POST') {
       // draft reset must NOT disconnect the league — league fields carry over
+      const keptEspn = ST.session.espn || {};
       ST.session = {
-        draft_id: null, my_slot: null, manual: {}, notes: {},
+        draft_id: null, my_slot: null, manual: {}, notes: {}, source: 'sleeper',
+        // ESPN cookies survive a draft reset (re-pasting them is the annoying part); league/team do not
+        espn: { league_id: null, season: null, team_id: null, espn_s2: keptEspn.espn_s2 || null, swid: keptEspn.swid || null },
         league_id: ST.session.league_id, my_roster_id: ST.session.my_roster_id, my_user_id: ST.session.my_user_id,
       };
       saveJson('session.json', ST.session);
@@ -2745,6 +3032,7 @@ const server = http.createServer(async (req, res) => {
 module.exports = {
   normName, normPos, normTeam, parseCsv, pickToSlot, rosterNeeds, draftSlots, lev, ST,
   resolvePlayer, buildNameIndex, COL_PATTERNS, externalNeedAdvice, parseAdviceJson, ADVISOR,
+  espnToDraft, espnLeagueUrl, espnHeaders, espnSeasonDefault, fetchEspnLeague, loadEspnPlayers, espnLookupIds, espnPlayers, sessionView, fetchJson, loadPlayers,
   // season pure math (selftest + tools)
   optimalLineup, projPoints, parseStatRows, buildValueIndex, lineupInfo, computeLineup,
   computeWaivers, computeNeedProfile, computeTradeEval, computeTradeScan, computeSeason,
@@ -2767,8 +3055,8 @@ process.on('unhandledRejection', (e) => { warn('unhandledRejection:', e && (e.st
     log(`Draft War Room on http://localhost:${PORT}${REPLAY ? ` [REPLAY via :${REPLAY_PORT}]` : ''}${MOCK_LLM ? ' [MOCK_LLM]' : ''}${SEASON_FIXTURE ? ' [SEASON_FIXTURE]' : ''} effort=${EFFORT}`);
     if (ADVISOR === 'external') log('EXTERNAL ADVISOR mode — advice comes from a Claude session (tools/advisor-watch.js wakes it; POST /api/advisor/submit delivers; 📋 in the UI copies the prompt for manual paste)');
     else if (!process.env.ANTHROPIC_API_KEY && !MOCK_LLM) warn('ANTHROPIC_API_KEY is not set — advisor disabled, fallback board only');
-    if (ST.session.draft_id) {
-      log(`resuming draft ${ST.session.draft_id} (slot ${ST.session.my_slot}) from session.json`);
+    if (ST.session.draft_id || (ST.session.source === 'espn' && ST.session.espn && ST.session.espn.league_id)) {
+      log(`resuming ${ST.session.source === 'espn' ? 'ESPN' : 'Sleeper'} draft ${ST.session.draft_id} (slot ${ST.session.my_slot}) from session.json`);
       startPolling();
     }
     if (ST.session.league_id && !SEASON_FIXTURE) {

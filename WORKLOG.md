@@ -381,3 +381,30 @@ to draft; draft paths untouched except 4 backward-compatible seams).
   recap/scoreboard test off-season. Fixture drill verified recap prompt e2e.
 - selftest: 110 assertions (adds bye plan, seeded playoff odds, recap math,
   alert seeding/dedupe).
+
+## 2026-09-06 — ESPN draft support (draft tonight on ESPN)
+
+- **Adapter, not a fork**: `espnToDraft(raw)` (server §7b) converts ESPN's league
+  document (`?view=mDraftDetail&view=mSettings&view=mTeam`) into the Sleeper
+  `{meta, picks}` shape. lineupSlotCounts -> slots_*, rounds = roster minus IR,
+  statId 53 -> ppr/half/std, pickOrder -> slot per team (falls back to
+  round-1 positional inference when the order isn't published yet), ESPN
+  player id -> Sleeper id via the CSV resolver (unmapped picks keep `espn:<id>`
+  + name metadata so the board's name-fallback still clears them).
+- `pollEspnOnce()` mirrors the Sleeper poller (same backoff/recovery, 3s cadence,
+  slows to 5s pre-draft / 30s complete). `session.source` selects the branch.
+  Player directory (`players?view=players_wl`) cached per season 24h, unknown
+  ids resolved on demand via `kona_player_info` filterIds.
+- Cookies (`espn_s2`, `SWID`) stored only in data/session.json + env; `sessionView()`
+  strips them from every broadcast/snapshot. Reset keeps cookies, drops league.
+- UI: source dropdown (Sleeper/ESPN), ESPN row (season + cookie inputs, saved ✓
+  hint), slot select shows team names; before the order is set it lists teams
+  and the slot fills in automatically on the first poll that sees the order.
+- Bug found in smoke: (re)connect didn't poll for up to 30s when the previous
+  draft was complete (idle cadence). `startPolling(true)` now restarts the timer.
+- Verified: selftest 143 (33 new ESPN conversion assertions); live rehearsal via
+  `tools/espn-mock.js` (real player names from the Sleeper cache) — connect,
+  slot mapping, 6/6 picks resolved to Sleeper ids + CSV rows, picks advanced
+  each poll, on-clock + `needAdvice` fired at my turn. `tools/espn-probe.js`
+  is the pre-draft check against the real league (field names confirmed only
+  against the mock so far — run the probe before the draft).

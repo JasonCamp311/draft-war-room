@@ -2826,7 +2826,8 @@ const server = http.createServer(async (req, res) => {
     // ---- ESPN browser relay (cross-origin POST from a logged-in espn.com tab) ----
     if (p === '/api/espn/relay') {
       const origin = req.headers.origin || '';
-      const cors = /^https:\/\/([a-z0-9-]+\.)*espn\.com$/i.test(origin) ? { 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, x-league', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-max-age': '600' } : {};
+      // Chrome's Private Network Access / Local Network Access preflight (public https page -> localhost)
+      const cors = /^https:\/\/([a-z0-9-]+\.)*espn\.com$/i.test(origin) ? { 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, x-league', 'access-control-allow-methods': 'POST, OPTIONS', 'access-control-max-age': '600', 'access-control-allow-private-network': 'true', 'access-control-allow-local-network': 'true' } : {};
       if (req.method === 'OPTIONS') { res.writeHead(204, cors); return res.end(); }
       if (req.method !== 'POST') return json(res, 405, { error: 'POST only' });
       const body = JSON.parse(await readBody(req, 30 * 1024 * 1024)); activate(ctx);

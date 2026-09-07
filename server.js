@@ -641,7 +641,9 @@ function computeBoard() {
   if (slotMismatch) anomalies.push(`${slotMismatch} pick(s) landed on unexpected slots — snake math may be off (3rd-round reversal? manual reorder?). Trust the picks feed, double-check "picks until you".`);
   if (meta.type === 'auction') anomalies.push('This is an AUCTION draft — this tool only supports snake/linear order math. Pick predictions will be wrong.');
 
-  const pickCount = picks.length;
+  // pick slots consumed so far: the highest pick number seen, not the count — a feed
+  // that misses a few picks (DOM relay) must not shift "who is on the clock"
+  const pickCount = Math.max(picks.length, maxNo);
   const currentPickNo = pickCount + 1;
   const cur = currentPickNo <= totalPicks ? pickToSlot(currentPickNo, meta) : null;
 
@@ -1044,7 +1046,9 @@ function espnToDraft(raw, opts = {}) {
   for (const p of rawPicks) if (p.roundId === 1 && !slotOfTeam.has(p.teamId)) slotOfTeam.set(p.teamId, positionalSlot(1, p.roundPickNumber));
   const unknownIds = [];
   const picks = rawPicks.map(p => {
-    const pl = lookup(p.playerId);
+    // DOM-relayed picks (from the draft room page) carry the name instead of an id:
+    // ESPN's league document does not list picks while a draft is live.
+    const pl = p.playerName ? { n: p.playerName, pos: normPos(p.position || ''), t: normTeam(p.proTeam || '') } : lookup(p.playerId);
     if (!pl) unknownIds.push(p.playerId);
     const name = pl ? pl.n : '';
     const r = pl ? resolve(pl.n, pl.pos, pl.t) : null;

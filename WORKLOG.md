@@ -447,3 +447,17 @@ to draft; draft paths untouched except 4 backward-compatible seams).
   now runs `tools/advisor-loop.js` under a persistent Monitor: one JSON line per
   wake (with `league`), waits for the submit before re-arming.
 - `/api/rankings/copy` reuses another league's CSV. Pre-baked round-1 rec for slot 6.
+
+## 2026-09-06 — ESPN live draft (Acture 2026): outcome
+
+- Drafted as advisor for all 16 rounds from slot 6 of 8; advice delivered in chat
+  (what Jason used under the 60s clock) and in the app. ESPN's league doc showed
+  no live picks; the draft room permits one session per account (opening it from
+  a second tab kicks the first). Final feed: Jason's own draft tab moved into the
+  Claude tab group + injected Activity-feed scraper (tools/espn-dom-relay.js).
+- Final roster: QB Hurts, Caleb Williams · RB Cook, Judkins, Henderson,
+  Stevenson, Jacobs · WR St. Brown, London, McConkey, Burden, Godwin, B. Thomas ·
+  TE McBride · K Dicker · DEF Rams.
+- Follow-ups: seed missing feed picks automatically (Pick History scrape when the
+  user opens that tab), persist advice across server restarts, and a "watch team
+  X" panel (Jason asked for Marcos's likely picks several times).
